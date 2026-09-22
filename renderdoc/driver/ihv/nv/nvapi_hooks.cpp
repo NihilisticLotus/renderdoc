@@ -623,11 +623,16 @@ private:
     }
     else
     {
+      // Modified build: pass through the real function pointer instead of returning NULL.
+      // Naughty Dog's ndgi (The Last of Us Part I/II PC) asserts NVAPI_OK == status in
+      // ndgi::Adapter::Adapter (ndgi-adapter-table-win.cpp:155) when adapter-info NvAPI
+      // entry points are missing, leaving the adapter table null and crashing the game.
+      // Device-object functions that need unwrapping are still intercepted above.
       static int count = 0;
       if(count < 10)
-        RDCWARN("NvAPI disabled: Returning NULL for nvapi_QueryInterface(%s)", name.c_str());
+        RDCWARN("NvAPI passthrough: Returning %p for nvapi_QueryInterface(%s)", real, name.c_str());
       count++;
-      return NULL;
+      return real;
     }
   }
 

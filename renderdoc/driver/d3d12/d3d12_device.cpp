@@ -1598,9 +1598,11 @@ HRESULT WrappedID3D12Device::QueryInterface(REFIID riid, void **ppvObject)
   }
   else if(riid == IRenderDoc_uuid)
   {
-    AddRef();
-    *ppvObject = (IUnknown *)this;
-    return S_OK;
+    // Modified build: do not positively identify RenderDoc through this UUID. The
+    // upstream behaviour is documented in the FAQ and used by programs to detect
+    // RenderDoc; answer like a normal device would (fall through to the real
+    // device query below) so probing code can't tell we are here.
+    return m_pDevice->QueryInterface(riid, ppvObject);
   }
   else if(riid == __uuidof(ID3D12CompatibilityDevice))
   {

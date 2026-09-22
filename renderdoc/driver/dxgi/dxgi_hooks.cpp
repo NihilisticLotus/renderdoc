@@ -26,6 +26,7 @@
 #include "core/core.h"
 #include "hooks/hooks.h"
 #include "dxgi_wrapped.h"
+#include "os/win32/export_patch.h"
 
 typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(REFIID, void **);
 typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY2)(UINT, REFIID, void **);
@@ -256,6 +257,11 @@ public:
     CreateDXGIFactory2.Register("dxgi.dll", "CreateDXGIFactory2", CreateDXGIFactory2_hook);
     GetDebugInterface.Register("dxgi.dll", "DXGIGetDebugInterface", DXGIGetDebugInterface_hook);
     GetDebugInterface1.Register("dxgi.dll", "DXGIGetDebugInterface1", DXGIGetDebugInterface1_hook);
+
+    // Modified build: also patch the dxgi.dll factory exports at the byte level so that
+    // programs resolving them by manually walking the export table get hooked factories
+    // (and therefore hooked swapchains). See os/win32/export_patch.h.
+    LibraryHooks::RegisterLibraryHook("dxgi.dll", &OnDxgiModuleLoaded);
   }
 
 private:
@@ -270,8 +276,76 @@ private:
   HookedFunction<PFN_GET_DEBUG_INTERFACE> GetDebugInterface;
   HookedFunction<PFN_GET_DEBUG_INTERFACE1> GetDebugInterface1;
 
+  // export patch trampolines (the real functions)
+  static PFN_CREATE_DXGI_FACTORY s_ExportRealCreateFactory;
+  static PFN_CREATE_DXGI_FACTORY s_ExportRealCreateFactory1;
+  static PFN_CREATE_DXGI_FACTORY2 s_ExportRealCreateFactory2;
+
+  static HRESULT WINAPI CreateDXGIFactoryExport_hook(__in REFIID riid, __out void **ppFactory)
+  {
+    RDCLOG("TRACE: CreateDXGIFactory EXPORT patch hit");
+    if(ppFactory)
+      *ppFactory = NULL;
+    HRESULT ret = s_ExportRealCreateFactory(riid, ppFactory);
+
+    if(SUCCEEDED(ret))
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory", riid, ppFactory);
+
+    return ret;
+  }
+
+  static HRESULT WINAPI CreateDXGIFactory1Export_hook(__in REFIID riid, __out void **ppFactory)
+  {
+    RDCLOG("TRACE: CreateDXGIFactory1 EXPORT patch hit");
+    if(ppFactory)
+      *ppFactory = NULL;
+    HRESULT ret = s_ExportRealCreateFactory1(riid, ppFactory);
+
+    if(SUCCEEDED(ret))
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory1", riid, ppFactory);
+
+    return ret;
+  }
+
+  static HRESULT WINAPI CreateDXGIFactory2Export_hook(UINT Flags, REFIID riid, void **ppFactory)
+  {
+    RDCLOG("TRACE: CreateDXGIFactory2 EXPORT patch hit");
+    if(ppFactory)
+      *ppFactory = NULL;
+    HRESULT ret = s_ExportRealCreateFactory2(Flags, riid, ppFactory);
+
+    if(SUCCEEDED(ret))
+      RefCountDXGIObject::HandleWrap("CreateDXGIFactory2", riid, ppFactory);
+
+    return ret;
+  }
+
+  static void OnDxgiModuleLoaded(void *handle, const char *name)
+  {
+    // verified prologues on win11 dxgi.dll (10.0.26100):
+    //   CreateDXGIFactory/1: 48 89 5C 24 18 | 48 89 7C 24 20 (5-byte movs)
+    //   CreateDXGIFactory2:   48 89 5C 24 08 | 48 89 74 24 10 (5-byte movs)
+    static const byte kPrefix2418[] = {0x48, 0x89, 0x5C, 0x24, 0x18};
+    static const byte kPrefix2408[] = {0x48, 0x89, 0x5C, 0x24, 0x08};
+
+    ExportPatch p0 = {"dxgi.dll", "CreateDXGIFactory",
+                      (void *)&CreateDXGIFactoryExport_hook, (void **)&s_ExportRealCreateFactory,
+                      kPrefix2418, sizeof(kPrefix2418), 10};
+    ExportPatch p1 = {"dxgi.dll", "CreateDXGIFactory1",
+                      (void *)&CreateDXGIFactory1Export_hook, (void **)&s_ExportRealCreateFactory1,
+                      kPrefix2418, sizeof(kPrefix2418), 10};
+    ExportPatch p2 = {"dxgi.dll", "CreateDXGIFactory2",
+                      (void *)&CreateDXGIFactory2Export_hook, (void **)&s_ExportRealCreateFactory2,
+                      kPrefix2408, sizeof(kPrefix2408), 10};
+
+    ApplyExportPatch((HMODULE)handle, p0);
+    ApplyExportPatch((HMODULE)handle, p1);
+    ApplyExportPatch((HMODULE)handle, p2);
+  }
+
   static HRESULT WINAPI CreateDXGIFactory_hook(__in REFIID riid, __out void **ppFactory)
   {
+    RDCLOG("TRACE: CreateDXGIFactory_hook called");
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory()(riid, ppFactory);
@@ -284,6 +358,7 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory1_hook(__in REFIID riid, __out void **ppFactory)
   {
+    RDCLOG("TRACE: CreateDXGIFactory1_hook called");
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory1()(riid, ppFactory);
@@ -296,6 +371,7 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory2_hook(UINT Flags, REFIID riid, void **ppFactory)
   {
+    RDCLOG("TRACE: CreateDXGIFactory2_hook called");
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = dxgihooks.CreateDXGIFactory2()(Flags, riid, ppFactory);
@@ -370,3 +446,6 @@ private:
 };
 
 DXGIHook DXGIHook::dxgihooks;
+PFN_CREATE_DXGI_FACTORY DXGIHook::s_ExportRealCreateFactory = NULL;
+PFN_CREATE_DXGI_FACTORY DXGIHook::s_ExportRealCreateFactory1 = NULL;
+PFN_CREATE_DXGI_FACTORY2 DXGIHook::s_ExportRealCreateFactory2 = NULL;

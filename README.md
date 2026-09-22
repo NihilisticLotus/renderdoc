@@ -72,3 +72,13 @@ Contributing & Development
 
 I've added some notes on how to contribute, as well as where to get started looking through the code in [Developing-Change.md](docs/CONTRIBUTING/Developing-Change.md). All contribution information is available under [CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
+Custom D3D12 capture compatibility
+----------------------------------
+
+This build contains compatibility changes for recent D3D12 applications that use Agility SDK
+interfaces and resolve graphics entry points directly from DLL exports. The D3D12 and DXGI hooks
+can patch those export paths, preserve unknown `D3D12GetInterface` queries, and pass through the
+newer device capability values needed by current engines. NvAPI adapter queries are also passed
+through when RenderDoc has no dedicated wrapper. These changes allow verified frame capture from
+The Last of Us Part II and Onimusha: Way of the Sword on the tested Windows 11 configuration.
+

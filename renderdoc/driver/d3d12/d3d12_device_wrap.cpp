@@ -2569,26 +2569,19 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
     if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
       return E_INVALIDARG;
 
-    // don't support DXR 1.2
-    opts->RaytracingTier = RDCMIN(opts->RaytracingTier, D3D12_RAYTRACING_TIER_1_1);
-
-    if(dolog)
-      RDCLOG("Clamping raytracing tier support");
+    // Modified build: report real capabilities instead of clamping. 2025/2026 engines
+    // (RE Engine, Naughty Dog ndgi) probe these at boot and abort when the wrapped device
+    // reports features as missing. Capture fidelity for these features may be reduced.
+    (void)opts;
 
     return S_OK;
   }
   else if(Feature == D3D12_FEATURE_D3D12_OPTIONS7)
   {
-    D3D12_FEATURE_DATA_D3D12_OPTIONS7 *opts =
-        (D3D12_FEATURE_DATA_D3D12_OPTIONS7 *)pFeatureSupportData;
     if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7))
       return E_INVALIDARG;
 
-    // don't support sampler feedback
-    opts->SamplerFeedbackTier = D3D12_SAMPLER_FEEDBACK_TIER_NOT_SUPPORTED;
-
-    if(dolog)
-      RDCLOG("Forcing no sampler feedback tier support");
+    // Modified build: report real sampler feedback tier
 
     return S_OK;
   }
@@ -2599,10 +2592,8 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
     if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS18))
       return E_INVALIDARG;
 
-    opts->RenderPassesValid = FALSE;
-
-    if(dolog)
-      RDCLOG("Forcing no changed renderpass support");
+    // Modified build: report real RenderPassesValid
+    (void)opts;
 
     return S_OK;
   }
@@ -2613,8 +2604,8 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
     if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS20))
       return E_INVALIDARG;
 
-    // unknown what this does, disable it
-    opts->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+    // Modified build: report real RecreateAtTier
+    (void)opts;
 
     return S_OK;
   }
@@ -2625,13 +2616,8 @@ HRESULT WrappedID3D12Device::CheckFeatureSupport(D3D12_FEATURE Feature, void *pF
     if(FeatureSupportDataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21))
       return E_INVALIDARG;
 
-    if(dolog)
-      RDCLOG("Forcing no EI 1.1 support");
-    opts->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
-
-    if(dolog)
-      RDCLOG("Forcing no work graph support");
-    opts->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
+    // Modified build: report real ExecuteIndirect tier and WorkGraphs tier
+    (void)opts;
 
     return S_OK;
   }

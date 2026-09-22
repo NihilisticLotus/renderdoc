@@ -1231,6 +1231,8 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::QueryInterface(REFIID riid, void 
 HRESULT WrappedIDXGIFactory::CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
                                              IDXGISwapChain **ppSwapChain)
 {
+  RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChain device=%p wnd=%p", pDevice,
+         pDesc ? (void *)pDesc->OutputWindow : NULL);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
 
   if(wrapDevice)
@@ -1270,6 +1272,8 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForHwnd(
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGIOutput *pRestrictToOutput,
     IDXGISwapChain1 **ppSwapChain)
 {
+  RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChainForHwnd device=%p hwnd=%p", pDevice,
+         (void *)hWnd);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
 
   WrappedIDXGIOutput6 *wrappedOutput = (WrappedIDXGIOutput6 *)pRestrictToOutput;
@@ -1368,6 +1372,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForComposition(IUnknown *pDevice,
                                                            IDXGIOutput *pRestrictToOutput,
                                                            IDXGISwapChain1 **ppSwapChain)
 {
+  RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChainForComposition device=%p", pDevice);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
 
   WrappedIDXGIOutput6 *wrappedOutput = (WrappedIDXGIOutput6 *)pRestrictToOutput;

@@ -32,6 +32,14 @@
 #include "d3d12_shader_cache.h"
 
 #include "driver/dx/official/D3D11On12On7.h"
+#include "os/win32/export_patch.h"
+
+// prologue signatures verified on:
+//   win11 system d3d12.dll (10.0.26100): 48 89 5C 24 08 ... (5-byte mov, then further
+//   reg saves - we only require the first instruction and relocate 2x5-byte movs)
+//   game-local Agility D3D12Core.dll:    4D 8B C8 | 4C 8B C2 (3-byte movs)
+static const byte kMovRspPrologue[] = {0x48, 0x89, 0x5C, 0x24, 0x08};
+static const byte kD3D12CorePrologue[] = {0x4D, 0x8B, 0xC8, 0x4C, 0x8B, 0xC2};
 
 typedef HRESULT(WINAPI *PFN_D3D12_ENABLE_EXPERIMENTAL_FEATURES)(UINT NumFeatures, const IID *pIIDs,
                                                                 void *pConfigurationStructs,
@@ -356,13 +364,17 @@ public:
   ULONG STDMETHODCALLTYPE Release() { return RefCounter12::Release(); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
   {
+    // newer revision GUID of ID3D12DeviceFactory, see D3D12GetInterface_Impl
+    static const GUID IID_ID3D12DeviceFactory_vNext = {
+        0xdfafdd2c, 0x355f, 0x4cb3, {0xa8, 0xb2, 0xea, 0x7f, 0x92, 0x60, 0x14, 0x8b}};
+
     if(riid == __uuidof(IUnknown))
     {
       *ppvObject = (IUnknown *)(ID3D12DeviceFactory *)this;
       AddRef();
       return S_OK;
     }
-    if(riid == __uuidof(ID3D12DeviceFactory))
+    if(riid == __uuidof(ID3D12DeviceFactory) || riid == IID_ID3D12DeviceFactory_vNext)
     {
       *ppvObject = (ID3D12DeviceFactory *)this;
       AddRef();
@@ -573,6 +585,16 @@ public:
     GetD3D11On12On7.Register("d3d11on12.dll", "GetD3D11On12On7Interface",
                              GetD3D11On12On7Interface_hook);
 
+    // hook the agility SDK's D3D12Core.dll D3D12GetInterface export as well, see comment on
+    // D3D12GetInterfaceCore_hook
+    LibraryHooks::RegisterLibraryHook("D3D12Core.dll", NULL);
+    GetInterfaceCore.Register("D3D12Core.dll", "D3D12GetInterface", D3D12GetInterfaceCore_hook);
+
+    // apply export-byte level patches to the critical D3D12 entry points, both on the system
+    // d3d12.dll now (loaded already) and whenever a local Agility D3D12Core.dll appears.
+    LibraryHooks::RegisterLibraryHook("d3d12.dll", &OnD3D12ModuleLoaded);
+    LibraryHooks::RegisterLibraryHook("D3D12Core.dll", &OnD3D12CoreModuleLoaded);
+
     m_RecurseSlot = Threading::AllocateTLSSlot();
     Threading::SetTLSValue(m_RecurseSlot, NULL);
   }
@@ -686,6 +708,7 @@ private:
 
   HookedFunction<PFN_D3D12_GET_DEBUG_INTERFACE> GetDebugInterface;
   HookedFunction<PFN_D3D12_GET_INTERFACE> GetInterface;
+  HookedFunction<PFN_D3D12_GET_INTERFACE> GetInterfaceCore;
   HookedFunction<PFN_D3D12_CREATE_DEVICE> CreateDevice;
   HookedFunction<PFN_D3D12_ENABLE_EXPERIMENTAL_FEATURES> EnableExperimentalFeatures;
   HookedFunction<PFNGetD3D11On12On7Interface> GetD3D11On12On7;
@@ -713,6 +736,8 @@ private:
                           IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
                           void **ppDevice)
   {
+    RDCLOG("TRACE: Create_Internal called adapter=%p riid=%s", (void *)pAdapter,
+           ToStr(riid).c_str());
     // if we're already inside a wrapped create i.e. this function, then DON'T do anything
     // special. Just grab the trampolined function and call it.
     if(CheckRecurse())
@@ -896,6 +921,9 @@ private:
                                                D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,
                                                void **ppDevice)
   {
+    RDCLOG("TRACE: D3D12CreateDevice_hook called adapter=%p riid=%s", (void *)pAdapter,
+           ToStr(riid).c_str());
+
     PFN_D3D12_CREATE_DEVICE createFunc = d3d12hooks.CreateDevice();
 
     if(!createFunc)
@@ -976,16 +1004,61 @@ private:
     return E_NOINTERFACE;
   }
 
-  static HRESULT WINAPI D3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  static HRESULT D3D12GetInterface_Impl(PFN_D3D12_GET_INTERFACE real, REFCLSID rclsid,
+                                        REFIID riid, void **ppvDebug)
   {
+    RDCLOG("TRACE: D3D12GetInterface called clsid=%s riid=%s", ToStr(rclsid).c_str(),
+           ToStr(riid).c_str());
     if(riid == CLSID_D3D12StateObjectFactory)
     {
       RDCLOG("Deliberately reporting no support for state object factories");
       return E_NOINTERFACE;
     }
 
+    // newer Agility SDK / OS D3D12 runtimes (2025+) hand out a newer revision of
+    // ID3D12DeviceFactory under a GUID that isn't in any public header yet.
+    // {dfafdd2c-355f-4cb3-a8b2-ea7f9260148b}
+    static const GUID IID_ID3D12DeviceFactory_vNext = {
+        0xdfafdd2c, 0x355f, 0x4cb3, {0xa8, 0xb2, 0xea, 0x7f, 0x92, 0x60, 0x14, 0x8b}};
+
     IUnknown *realUnk = NULL;
-    HRESULT real = d3d12hooks.GetInterface()(rclsid, riid, (void **)&realUnk);
+    HRESULT real_call = real(rclsid, riid, (void **)&realUnk);
+
+    if(SUCCEEDED(real_call) && realUnk && riid == IID_ID3D12DeviceFactory_vNext)
+    {
+      // identify what module the returned object's functions live in, for diagnostics
+      void **vt = *(void ***)realUnk;
+      for(int i = 0; i < 6; i++)
+      {
+        HMODULE m = NULL;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)vt[i], &m);
+        wchar_t modname[MAX_PATH] = {};
+        if(m)
+          GetModuleFileNameW(m, modname, MAX_PATH);
+        RDCLOG("vNext vtable[%d] = %p (%ls)", i, vt[i], m ? modname : L"unknown");
+      }
+
+      // try to obtain the publicly-known ID3D12DeviceFactory from the same object and wrap
+      // that, so device creation goes through our Create_Internal
+      ID3D12DeviceFactory *known = NULL;
+      HRESULT qih = realUnk->QueryInterface(__uuidof(ID3D12DeviceFactory), (void **)&known);
+      RDCLOG("vNext interface: QI for known ID3D12DeviceFactory -> %x", qih);
+
+      if(SUCCEEDED(qih) && known)
+      {
+        *ppvDebug = new WrappedID3D12DeviceFactory(known);
+        RDCLOG("vNext interface: wrapped as ID3D12DeviceFactory");
+        return S_OK;
+      }
+
+      // can't wrap - pass the raw interface through rather than failing. RE Engine
+      // (Onimusha WotS) aborts outright if this query returns E_NOINTERFACE.
+      RDCLOG("vNext interface: passing through raw, capture of this device not possible");
+      *ppvDebug = realUnk;
+      return S_OK;
+    }
 
     HRESULT hr = GetWrappedInterface(realUnk, riid, ppvDebug);
 
@@ -996,13 +1069,98 @@ private:
       return hr;
 
     RDCWARN("Unknown UUID passed to D3D12GetInterface: %s (clsid %s). Real call %s succeed (%x).",
-            ToStr(riid).c_str(), ToStr(rclsid).c_str(), SUCCEEDED(real) ? "did" : "did not", real);
+            ToStr(riid).c_str(), ToStr(rclsid).c_str(), SUCCEEDED(real_call) ? "did" : "did not",
+            real_call);
 
     return E_NOINTERFACE;
+  }
+
+  static HRESULT WINAPI D3D12GetInterface_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  {
+    return D3D12GetInterface_Impl(d3d12hooks.GetInterface(), rclsid, riid, ppvDebug);
+  }
+
+  // The D3D12 Agility SDK ships its own D3D12Core.dll next to the program, which exports
+  // D3D12GetInterface. A program can load that DLL directly and create its device factory
+  // without ever touching the system d3d12.dll exports we patch above. Hook the agility
+  // module as well so those programs are captured too (e.g. The Last of Us Part II's ndgi).
+  static HRESULT WINAPI D3D12GetInterfaceCore_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  {
+    return D3D12GetInterface_Impl(d3d12hooks.GetInterfaceCore(), rclsid, riid, ppvDebug);
+  }
+
+  //////////////////////////////
+  // export-byte patching (see comment block near the top of this file)
+
+  typedef HRESULT(WINAPI *PFN_D3D12_GET_INTERFACE_RAW)(REFCLSID, REFIID, void **);
+  typedef HRESULT(WINAPI *PFN_D3D12_CREATE_DEVICE_RAW)(IUnknown *, D3D_FEATURE_LEVEL, REFIID,
+                                                       void **);
+
+  static PFN_D3D12_CREATE_DEVICE_RAW s_ExportRealCreateDevice;
+  static PFN_D3D12_GET_INTERFACE_RAW s_ExportRealGetInterface;
+
+  static HRESULT WINAPI D3D12CreateDeviceExport_hook(IUnknown *pAdapter,
+                                                     D3D_FEATURE_LEVEL MinimumFeatureLevel,
+                                                     REFIID riid, void **ppDevice)
+  {
+    RDCLOG("TRACE: D3D12CreateDevice EXPORT patch hit");
+    if(!s_ExportRealCreateDevice)
+      return E_UNEXPECTED;
+    return d3d12hooks.Create_Internal(s_ExportRealCreateDevice, NULL, pAdapter,
+                                      MinimumFeatureLevel, riid, ppDevice);
+  }
+
+  static HRESULT WINAPI D3D12GetInterfaceExport_hook(REFCLSID rclsid, REFIID riid, void **ppvDebug)
+  {
+    RDCLOG("TRACE: D3D12GetInterface EXPORT patch hit clsid=%s", ToStr(rclsid).c_str());
+    if(!s_ExportRealGetInterface)
+      return E_UNEXPECTED;
+    return D3D12GetInterface_Impl(s_ExportRealGetInterface, rclsid, riid, ppvDebug);
+  }
+
+  static void PatchD3D12ExportsOfModule(HMODULE mod, const char *moduleName)
+  {
+    RDCLOG("ExportPatch: processing module %s", moduleName);
+
+    bool isCore = (strcmp(moduleName, "D3D12Core.dll") == 0);
+
+    ExportPatch createPatch = {
+        moduleName,
+        "D3D12CreateDevice",
+        (void *)&D3D12CreateDeviceExport_hook,
+        (void **)&s_ExportRealCreateDevice,
+        kMovRspPrologue,
+        sizeof(kMovRspPrologue),
+        10,
+    };
+    ExportPatch getIfacePatch = {
+        moduleName,
+        "D3D12GetInterface",
+        (void *)&D3D12GetInterfaceExport_hook,
+        (void **)&s_ExportRealGetInterface,
+        isCore ? kD3D12CorePrologue : kMovRspPrologue,
+        isCore ? sizeof(kD3D12CorePrologue) : sizeof(kMovRspPrologue),
+        isCore ? (size_t)6 : (size_t)10,
+    };
+
+    ApplyExportPatch(mod, createPatch);
+    ApplyExportPatch(mod, getIfacePatch);
+  }
+
+  static void OnD3D12ModuleLoaded(void *handle, const char *name)
+  {
+    PatchD3D12ExportsOfModule((HMODULE)handle, "d3d12.dll");
+  }
+
+  static void OnD3D12CoreModuleLoaded(void *handle, const char *name)
+  {
+    PatchD3D12ExportsOfModule((HMODULE)handle, "D3D12Core.dll");
   }
 };
 
 D3D12Hook D3D12Hook::d3d12hooks;
+D3D12Hook::PFN_D3D12_CREATE_DEVICE_RAW D3D12Hook::s_ExportRealCreateDevice = NULL;
+D3D12Hook::PFN_D3D12_GET_INTERFACE_RAW D3D12Hook::s_ExportRealGetInterface = NULL;
 
 HRESULT CreateD3D12_Internal(RealD3D12CreateFunction real, D3D12DevConfiguration *devConfig,
                              IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid,

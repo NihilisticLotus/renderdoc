@@ -295,6 +295,7 @@ private:
       AGSContext *context, const AGSDX12DeviceCreationParams *creationParams,
       const AGSDX12ExtensionParams *extensionParams, AGSDX12ReturnedParams *returnedParams)
   {
+    RDCLOG("TRACE: agsDriverExtensionsDX12_CreateDevice_hook called");
     AGSReturnCode ret = AGS_SUCCESS;
     ID3D12Device *dev = NULL;
     CreateD3D12_Internal(
