@@ -32,6 +32,7 @@ ID3D11Resource *UnwrapDXResource(void *dxObject);
 IDXGIResource *UnwrapDXGIResource(void *dxgiObject);
 
 WRAPPED_POOL_INST(WrappedIDXGIDevice4);
+WRAPPED_POOL_INST(WrappedIDXGIFactory);
 
 rdcarray<D3DDeviceCallback> WrappedIDXGISwapChain4::m_D3DCallbacks;
 
@@ -55,6 +56,12 @@ bool RefCountDXGIObject::HandleWrap(const char *ifaceName, REFIID riid, void **p
     RDCWARN("HandleWrap called with NULL ppvObject querying %s", ifaceName);
     return false;
   }
+
+  // The IAT hook can call through the patched export, or an existing overlay
+  // hook can re-enter another factory export. Preserve an already wrapped
+  // factory's identity and reference count instead of wrapping it twice.
+  if(WrappedIDXGIFactory::IsAlloc(*ppvObject))
+    return true;
 
   // unknown GUID that we only want to print once to avoid log spam
   // {79D2046C-22EF-451B-9E74-2245D9C760EA}

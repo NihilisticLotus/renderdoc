@@ -1467,6 +1467,8 @@ class WrappedIDXGIFactory : public IDXGIFactory7, public RefCountDXGIObject
   IDXGIFactory7 *m_pReal7;
 
 public:
+  ALLOCATE_WITH_WRAPPED_POOL(WrappedIDXGIFactory);
+
   WrappedIDXGIFactory(IDXGIFactory *real);
   virtual ~WrappedIDXGIFactory();
 

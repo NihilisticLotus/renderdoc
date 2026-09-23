@@ -1013,6 +1013,46 @@ void WrappedID3D12CommandQueue::ExecuteCommandListsInternal(UINT NumCommandLists
       if(!forceMapsListEvent)
         WrappedID3D12Resource::GetMappableIDs(GetResourceManager(), refdIDs, mappableIDs);
 
+      // Some applications keep writing GPU-upload memory after Unmap. Its contents at
+      // submission can therefore differ from the Unmap snapshot, even though it is no
+      // longer in GetMaps(). Read back referenced, unmapped GPU-upload buffers as well.
+      // Keep each snapshot in the submission stream so replay sees the same CPU writes.
+      for(ResourceId id : refdIDs)
+      {
+        if(!GetResourceManager()->HasResource(id))
+          continue;
+        ID3D12DeviceChild *child = GetResourceManager()->GetResource(id);
+        if(!child || TryIdentifyTypeByPtr(child) != Resource_Resource)
+          continue;
+        ID3D12Resource *resource = (ID3D12Resource *)child;
+        D3D12_HEAP_PROPERTIES props = {};
+        resource->GetHeapProperties(&props, NULL);
+        if(props.Type != D3D12_HEAP_TYPE_GPU_UPLOAD ||
+           resource->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+          continue;
+
+        SCOPED_LOCK(GetRecord(resource)->m_MapLock);
+        // Persistently mapped buffers are already handled by the diff-based flush below.
+        if(GetWrapped(resource)->GetMap(0))
+          continue;
+
+        size_t size = (size_t)resource->GetDesc().Width;
+        QueueReadbackData &readback = m_pDevice->GetQueueReadbackData();
+        SCOPED_LOCK(readback.lock);
+        readback.Resize(size);
+        readback.list->Reset(readback.alloc, NULL);
+        Unwrap(readback.list)
+            ->CopyBufferRegion(readback.unwrappedReadbackBuf, 0, Unwrap(resource), 0, size);
+        readback.list->Close();
+        ID3D12CommandList *list = Unwrap(readback.list);
+        readback.unwrappedQueue->ExecuteCommandLists(1, &list);
+        m_pDevice->QueueWaitForIdle(readback.unwrappedQueue, Unwrap(readback.fence));
+        D3D12_RANGE range = {0, size};
+        m_pDevice->MapDataWrite(resource, 0, readback.readbackMapped, range, false);
+        RDCDEBUG("GPU_UPLOAD submit capture %s queue %s bytes=%llu", ToStr(id).c_str(),
+                 ToStr(GetResourceID()).c_str(), (uint64_t)size);
+      }
+
       for(auto it = maps.begin(); it != maps.end(); ++it)
       {
         WrappedID3D12Resource *res = GetWrapped(it->res);

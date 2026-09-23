@@ -34,6 +34,7 @@
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
+#include <fstream>
 #include <string>
 
 static rdcarray<EnvironmentModification> &GetEnvModifications()
@@ -1134,6 +1135,139 @@ uint32_t Process::LaunchScript(const rdcstr &script, const rdcstr &workingDir,
   return LaunchProcess("cmd.exe", workingDir, args, internal, result);
 }
 
+static bool ProcessImageMatches(DWORD pid, const rdcstr &expected)
+{
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if(!process)
+    return false;
+
+  wchar_t imagePath[32768] = {};
+  DWORD imageLength = DWORD(sizeof(imagePath) / sizeof(imagePath[0]));
+  BOOL queried = QueryFullProcessImageNameW(process, 0, imagePath, &imageLength);
+  CloseHandle(process);
+
+  if(!queried)
+    return false;
+
+  rdcwstr expectedWide = StringFormat::UTF82Wide(expected);
+  return _wcsicmp(imagePath, expectedWide.c_str()) == 0;
+}
+
+static rdcstr FindSteamAppID(const rdcstr &app)
+{
+  // Steam-launched games commonly depend on these two variables even when the executable is
+  // selected directly in RenderDoc's Launch dialog. Resolve them from the install manifest rather
+  // than adding a title-specific exception or requiring the user to type environment variables.
+  rdcstr steamapps = get_dirname(get_dirname(get_dirname(app)));
+  if(strlower(get_basename(steamapps)) != "steamapps")
+    return {};
+
+  rdcstr installDir = get_basename(get_dirname(app));
+  rdcwstr pattern = StringFormat::UTF82Wide(steamapps + "/appmanifest_*.acf");
+  WIN32_FIND_DATAW data = {};
+  HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+  if(find == INVALID_HANDLE_VALUE)
+    return {};
+
+  rdcstr appID;
+  do
+  {
+    rdcstr manifestName = StringFormat::Wide2UTF8(rdcwstr(data.cFileName));
+    if(manifestName.size() <= 18 || manifestName.substr(0, 12) != "appmanifest_" ||
+       manifestName.substr(manifestName.size() - 4) != ".acf")
+      continue;
+
+    rdcstr candidate = manifestName.substr(12, manifestName.size() - 16);
+    std::ifstream manifest((steamapps + "/" + manifestName).c_str(), std::ios::binary);
+    if(!manifest)
+      continue;
+    std::string contents((std::istreambuf_iterator<char>(manifest)), std::istreambuf_iterator<char>());
+    std::string key = "\"installdir\"";
+    size_t keyPos = contents.find(key);
+    if(keyPos == std::string::npos)
+      continue;
+    size_t valueStart = contents.find('"', contents.find('\t', keyPos));
+    if(valueStart == std::string::npos)
+      continue;
+    valueStart++;
+    size_t valueEnd = contents.find('"', valueStart);
+    if(valueEnd == std::string::npos)
+      continue;
+    if(_stricmp(contents.substr(valueStart, valueEnd - valueStart).c_str(), installDir.c_str()) == 0)
+    {
+      appID = candidate;
+      break;
+    }
+  } while(FindNextFileW(find, &data));
+
+  FindClose(find);
+  return appID;
+}
+
+static bool HasEnvironmentModification(const rdcarray<EnvironmentModification> &env,
+                                       const char *name)
+{
+  for(const EnvironmentModification &mod : env)
+    if(mod.name == name || strlower(mod.name) == strlower(name))
+      return true;
+  return false;
+}
+
+static DWORD FindReplacementProcess(const rdcstr &app, DWORD originalPid,
+                                    const rdcarray<DWORD> &existingPids, bool allowSteamDescendants)
+{
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if(snapshot == INVALID_HANDLE_VALUE)
+    return 0;
+
+  PROCESSENTRY32W entry = {};
+  entry.dwSize = sizeof(entry);
+  DWORD replacement = 0;
+
+  if(Process32FirstW(snapshot, &entry))
+  {
+    do
+    {
+      bool alreadyPresent = false;
+      for(DWORD existing : existingPids)
+      {
+        if(existing == entry.th32ProcessID)
+        {
+          alreadyPresent = true;
+          break;
+        }
+      }
+
+      bool sameImage = ProcessImageMatches(entry.th32ProcessID, app);
+      bool steamDescendant = false;
+      if(allowSteamDescendants && !sameImage && entry.th32ParentProcessID == originalPid)
+      {
+        HANDLE child = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        if(child)
+        {
+          wchar_t childPath[32768] = {};
+          DWORD childLen = DWORD(sizeof(childPath) / sizeof(childPath[0]));
+          if(QueryFullProcessImageNameW(child, 0, childPath, &childLen))
+          {
+            rdcwstr installPath = StringFormat::UTF82Wide(get_dirname(app) + "\\");
+            steamDescendant = _wcsnicmp(childPath, installPath.c_str(), wcslen(installPath.c_str())) == 0;
+          }
+          CloseHandle(child);
+        }
+      }
+
+      if(entry.th32ProcessID != originalPid && !alreadyPresent && (sameImage || steamDescendant))
+      {
+        replacement = entry.th32ProcessID;
+        break;
+      }
+    } while(Process32NextW(snapshot, &entry));
+  }
+
+  CloseHandle(snapshot);
+  return replacement;
+}
+
 rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
     const rdcarray<EnvironmentModification> &env, const rdcstr &capturefile,
@@ -1163,7 +1297,40 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     return {result, 0};
   }
 
-  PROCESS_INFORMATION pi = RunProcess(app, workingDir, cmdLine, env, false, NULL, NULL);
+  rdcarray<DWORD> existingPids;
+  {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if(snapshot != INVALID_HANDLE_VALUE)
+    {
+      PROCESSENTRY32W entry = {};
+      entry.dwSize = sizeof(entry);
+      if(Process32FirstW(snapshot, &entry))
+      {
+        do
+        {
+          if(ProcessImageMatches(entry.th32ProcessID, app))
+            existingPids.push_back(entry.th32ProcessID);
+        } while(Process32NextW(snapshot, &entry));
+      }
+      CloseHandle(snapshot);
+    }
+  }
+
+  rdcarray<EnvironmentModification> launchEnv = env;
+  rdcstr steamAppID = FindSteamAppID(app);
+  if(!steamAppID.empty())
+  {
+    if(!HasEnvironmentModification(launchEnv, "SteamAppId"))
+      launchEnv.push_back(
+          EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamAppId", steamAppID));
+    if(!HasEnvironmentModification(launchEnv, "SteamGameId"))
+      launchEnv.push_back(
+          EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamGameId", steamAppID));
+    RDCLOG("Detected Steam install manifest for %s (AppID %s); supplying Steam runtime variables",
+           app.c_str(), steamAppID.c_str());
+  }
+
+  PROCESS_INFORMATION pi = RunProcess(app, workingDir, cmdLine, launchEnv, false, NULL, NULL);
 
   if(pi.dwProcessId == 0)
   {
@@ -1172,11 +1339,42 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     return {result, 0};
   }
 
-  rdcpair<RDResult, uint32_t> ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
+  rdcpair<RDResult, uint32_t> ret =
+      InjectIntoProcess(pi.dwProcessId, launchEnv, capturefile, opts, false);
+
+  ResumeThread(pi.hThread);
+  ResumeThread(pi.hThread);
+
+  // Some Steam games are bootstrap executables: the process RenderDoc starts exits and Steam
+  // creates a second process with the same image. The normal injection above succeeds for the
+  // bootstrap process but cannot reach the replacement. Detect that handoff and inject the new
+  // process through the same standard Launch path.
+  if(ret.first == ResultCode::Succeeded)
+  {
+    DWORD replacementPid = 0;
+    // A launcher can take a couple of seconds to hand off to the real process even while the
+    // suspended bootstrap has already completed our injected calls. Keep this window bounded,
+    // but do not stop merely because the bootstrap is still alive at the first poll.
+    const uint64_t deadline = GetTickCount64() + 8000;
+    while(GetTickCount64() < deadline)
+    {
+      replacementPid = FindReplacementProcess(app, pi.dwProcessId, existingPids, !steamAppID.empty());
+      if(replacementPid)
+      {
+        RDCLOG("Detected replacement process %u for launched process %u; injecting RenderDoc",
+               replacementPid, pi.dwProcessId);
+        rdcpair<RDResult, uint32_t> replacementRet =
+            InjectIntoProcess(replacementPid, launchEnv, capturefile, opts, false);
+        if(replacementRet.first == ResultCode::Succeeded)
+          ret = replacementRet;
+        break;
+      }
+
+      Sleep(25);
+    }
+  }
 
   CloseHandle(pi.hProcess);
-  ResumeThread(pi.hThread);
-  ResumeThread(pi.hThread);
 
   if(ret.second == 0 || ret.first != ResultCode::Succeeded)
   {
@@ -1239,6 +1437,35 @@ static RDResult HandleRegError(HKEY keyNative, HKEY keyWow32, LSTATUS ret, const
     return HandleRegError(keyNative, keyWow32, ret, msg); \
   }
 
+// AppInit_DLLs is a whitespace-separated list. Historically RenderDoc always converted the shim
+// path to 8.3 form because that was the only way to represent paths containing spaces. 8.3 names
+// are optional on Windows though, and this machine has them disabled on E:. An absolute path with
+// no whitespace is valid as-is, so keep the long path in that case instead of rejecting the hook.
+static bool GetAppInitPath(const rdcstr &shimpath, rdcwstr &appinitPath)
+{
+  rdcwstr longpathData = StringFormat::UTF82Wide(shimpath);
+  std::wstring longpath(longpathData.c_str());
+
+  DWORD shortSize = GetShortPathNameW(longpath.c_str(), NULL, 0);
+  if(shortSize > 0 && shortSize < DWORD(longpath.size() + 1))
+  {
+    std::wstring shortpath(shortSize, L'\0');
+    DWORD written = GetShortPathNameW(longpath.c_str(), &shortpath[0], shortSize);
+    if(written > 0 && written < shortSize)
+    {
+      shortpath.resize(written);
+      appinitPath = rdcwstr(shortpath.c_str());
+      return true;
+    }
+  }
+
+  if(longpath.find(L' ') != std::wstring::npos || longpath.find(L'\t') != std::wstring::npos)
+    return false;
+
+  appinitPath = rdcwstr(longpath.c_str());
+  return true;
+}
+
 // function to backup the previous settings for AppInit, then enable it and write our own paths.
 RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpathWow32,
                                  const rdcstr &shimpathNative)
@@ -1246,32 +1473,15 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
   HKEY keyNative = NULL;
   HKEY keyWow32 = NULL;
 
-  // AppInit_DLLs requires short paths, but short paths can be disabled globally or on a per-volume
-  // level. If short paths are disabled we'll get the long path back, we *always* expect the path to
-  // get shorter because the shim filename is bigger than 8.3.
-
-  DWORD nativeShortSize = GetShortPathNameW(StringFormat::UTF82Wide(shimpathNative).c_str(), NULL,
-                                            (DWORD)shimpathNative.length());
-  if(nativeShortSize == (DWORD)shimpathNative.length() + 1)
+  rdcwstr appinitNative;
+  rdcwstr appinitWow32;
+  if(!GetAppInitPath(shimpathNative, appinitNative) ||
+     (!shimpathWow32.empty() && !GetAppInitPath(shimpathWow32, appinitWow32)))
   {
     RETURN_ERROR_RESULT(
         ResultCode::FileIOFailed,
-        "RenderDoc is installed on a volume or system that has short paths disabled.\n"
-        "For the global hook, short paths must be enabled where RenderDoc is installed.");
-  }
-
-  if(!shimpathWow32.empty())
-  {
-    DWORD wow32ShortSize = GetShortPathNameW(StringFormat::UTF82Wide(shimpathWow32).c_str(), NULL,
-                                             (DWORD)shimpathWow32.length());
-
-    if(wow32ShortSize == (DWORD)shimpathWow32.length() + 1)
-    {
-      RETURN_ERROR_RESULT(
-          ResultCode::FileIOFailed,
-          "RenderDoc is installed on a volume or system that has short paths disabled.\n"
-          "For the global hook, short paths must be enabled where RenderDoc is installed.");
-    }
+        "The RenderDoc hook path contains whitespace and this Windows installation has no 8.3 "
+        "short path available. Move RenderDoc to a path without spaces or enable 8.3 names.");
   }
 
   // open the native key
@@ -1313,12 +1523,8 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
   ret = RegSetValueExA(keyNative, "LoadAppInit_DLLs", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
   REG_CHECK("Could not set LoadAppInit_DLLs");
 
-  rdcwstr shortpath(shimpathNative.size());
-  GetShortPathNameW(StringFormat::UTF82Wide(shimpathNative).c_str(), shortpath.data(),
-                    (DWORD)shortpath.length());
-
-  ret = RegSetValueExW(keyNative, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)shortpath.data(),
-                       DWORD(shortpath.length() * sizeof(wchar_t)));
+  ret = RegSetValueExW(keyNative, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)appinitNative.data(),
+                       DWORD(appinitNative.length() * sizeof(wchar_t)));
   REG_CHECK("Could not set AppInit_DLLs");
 
   // if we're doing Wow32, repeat the process for those keys
@@ -1342,12 +1548,8 @@ RDResult BackupAndChangeRegistry(GlobalHookData &hookdata, const rdcstr &shimpat
     ret = RegSetValueExA(keyWow32, "LoadAppInit_DLLs", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
     REG_CHECK("Could not set LoadAppInit_DLLs");
 
-    shortpath = rdcwstr(shimpathWow32.size());
-    GetShortPathNameW(StringFormat::UTF82Wide(shimpathWow32).c_str(), shortpath.data(),
-                      (DWORD)shortpath.length());
-
-    ret = RegSetValueExW(keyWow32, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)shortpath.data(),
-                         DWORD(shortpath.length() * sizeof(wchar_t)));
+    ret = RegSetValueExW(keyWow32, L"AppInit_DLLs", 0, REG_SZ, (const BYTE *)appinitWow32.data(),
+                         DWORD(appinitWow32.length() * sizeof(wchar_t)));
     REG_CHECK("Could not set AppInit_DLLs");
   }
 

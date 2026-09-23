@@ -3038,12 +3038,8 @@ protected:
 
 #include <shellapi.h>
 
-typedef LSTATUS(APIENTRY *PFN_RegCreateKeyExA)(HKEY hKey, LPCSTR lpSubKey, DWORD Reserved,
-                                               LPSTR lpClass, DWORD dwOptions, REGSAM samDesired,
-                                               CONST LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-                                               PHKEY phkResult, LPDWORD lpdwDisposition);
-
-typedef LSTATUS(APIENTRY *PFN_RegCloseKey)(HKEY hKey);
+typedef BOOL(WINAPI *PFN_OpenProcessToken)(HANDLE, DWORD, PHANDLE);
+typedef BOOL(WINAPI *PFN_GetTokenInformation)(HANDLE, TOKEN_INFORMATION_CLASS, LPVOID, DWORD, PDWORD);
 
 #else
 
@@ -3054,31 +3050,31 @@ typedef LSTATUS(APIENTRY *PFN_RegCloseKey)(HKEY hKey);
 bool IsRunningAsAdmin()
 {
 #if defined(Q_OS_WIN32)
-  // try to open HKLM\Software for write.
-  HKEY key = NULL;
-
-  // access dynamically to get around the pain of trying to link to extra window libs in qt
+  // Registry ACLs are independent of elevation. An elevated user may be allowed to update
+  // AppInit_DLLs without having write access to the parent HKLM\SOFTWARE key.
+  // Access dynamically to avoid adding a Windows library dependency to Qt builds.
   HMODULE mod = LoadLibraryA("advapi32.dll");
 
   if(mod == NULL)
     return false;
 
-  PFN_RegCreateKeyExA create = (PFN_RegCreateKeyExA)GetProcAddress(mod, "RegCreateKeyExA");
-  PFN_RegCloseKey close = (PFN_RegCloseKey)GetProcAddress(mod, "RegCloseKey");
-
-  LSTATUS ret = ERROR_PROC_NOT_FOUND;
-
-  if(create && close)
+  PFN_OpenProcessToken openToken = (PFN_OpenProcessToken)GetProcAddress(mod, "OpenProcessToken");
+  PFN_GetTokenInformation getTokenInformation =
+      (PFN_GetTokenInformation)GetProcAddress(mod, "GetTokenInformation");
+  bool elevated = false;
+  HANDLE token = NULL;
+  if(openToken && getTokenInformation && openToken(GetCurrentProcess(), TOKEN_QUERY, &token))
   {
-    ret = create(HKEY_LOCAL_MACHINE, "SOFTWARE", 0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &key, NULL);
-
-    if(key)
-      close(key);
+    TOKEN_ELEVATION elevation = {};
+    DWORD size = 0;
+    elevated = getTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size) &&
+               elevation.TokenIsElevated != 0;
+    CloseHandle(token);
   }
 
   FreeLibrary(mod);
 
-  return (ret == ERROR_SUCCESS);
+  return elevated;
 
 #else
 

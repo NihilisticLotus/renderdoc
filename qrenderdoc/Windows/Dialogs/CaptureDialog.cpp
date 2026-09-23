@@ -912,7 +912,11 @@ void CaptureDialog::SetSettings(CaptureSettings settings)
   SetInjectMode(settings.inject);
 
   ui->exePath->setText(settings.executable);
-  ui->workDirPath->setText(settings.workingDir);
+  QString workingDir = settings.workingDir;
+  if(workingDir.isEmpty() && !settings.executable.isEmpty() &&
+     !m_Ctx.Replay().CurrentRemote().IsValid())
+    workingDir = QFileInfo(settings.executable).absolutePath();
+  ui->workDirPath->setText(workingDir);
   ui->cmdline->setText(settings.commandLine);
 
   SetEnvironmentModifications(settings.environment);
@@ -1121,8 +1125,10 @@ CaptureSettings CaptureDialog::LoadSettingsFromDisk(const rdcstr &filename)
 
 void CaptureDialog::UpdateGlobalHook()
 {
+  const bool globalHookActive = RENDERDOC_IsGlobalHookActive();
   ui->globalGroup->setVisible(!IsInjectMode() && m_Ctx.Config().AllowGlobalHook &&
                               RENDERDOC_CanGlobalHook());
+  ui->globalLabel->setVisible(!globalHookActive);
 
   if(ui->exePath->text().length() >= 4)
   {

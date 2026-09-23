@@ -19,6 +19,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include "common/threading.h"
 #include "hooks/hooks.h"
 #include "common/formatting.h"
 
@@ -59,6 +60,10 @@ inline byte *ExportPatch_AllocateNear(HMODULE mod, size_t size)
 
 inline bool ApplyExportPatch(HMODULE mod, const ExportPatch &patch)
 {
+#if !defined(_WIN64)
+  // The entry stub below uses the x64 RIP-relative indirect jump encoding.
+  return false;
+#else
   void *proc = NULL;
   {
     ScopedSuppressHooking suppress;
@@ -71,14 +76,45 @@ inline bool ApplyExportPatch(HMODULE mod, const ExportPatch &patch)
   }
 
   byte *orig = (byte *)proc;
-
-  if(orig[0] == 0xE9)
+  struct InstalledPatch
   {
-    RDCLOG("ExportPatch: %s!%s appears already patched", patch.moduleName, patch.exportName);
+    byte *entry;
+    byte *trampoline;
+    void *hook;
+  };
+  static Threading::CriticalSection installLock;
+  static rdcarray<InstalledPatch> installed;
+  SCOPED_LOCK(installLock);
+
+  // Only our own recorded installation is idempotent. An E9 at the export can
+  // belong to another interceptor (e.g. Steam's overlay), not to RenderDoc.
+  for(const InstalledPatch &previous : installed)
+  {
+    if(previous.entry != orig)
+      continue;
+    if(previous.hook != patch.hookFn)
+      return false;
+    if(patch.trampolineOut)
+      *patch.trampolineOut = previous.trampoline;
     return true;
   }
 
-  if(memcmp(orig, patch.expectedPrefix, patch.expectedPrefixLen) != 0)
+  byte *previousTarget = NULL;
+  const bool chainJump = orig[0] == 0xE9;
+  const size_t patchBytes = chainJump ? 5 : patch.prologueBytes;
+  if(!patch.trampolineOut || patchBytes < 5 || patchBytes + 5 > 64 ||
+     (!chainJump && patch.expectedPrefixLen > patchBytes))
+    return false;
+
+  if(chainJump)
+  {
+    int32_t displacement = 0;
+    memcpy(&displacement, orig + 1, sizeof(displacement));
+    previousTarget = orig + 5 + displacement;
+    if(previousTarget == orig)
+      return false;
+  }
+  else if(memcmp(orig, patch.expectedPrefix, patch.expectedPrefixLen) != 0)
   {
     RDCLOG("ExportPatch: %s!%s prologue does not match expected pattern "
            "(got %02x %02x %02x %02x %02x %02x), skipping",
@@ -98,11 +134,23 @@ inline bool ApplyExportPatch(HMODULE mod, const ExportPatch &patch)
   byte *tramp = mem;
   byte *stub = mem + 64;
 
-  memcpy(tramp, orig, patch.prologueBytes);
-  int32_t back = int32_t((uintptr_t)(orig + patch.prologueBytes) -
-                         (uintptr_t)(tramp + patch.prologueBytes + 5));
-  tramp[patch.prologueBytes] = 0xE9;
-  memcpy(tramp + patch.prologueBytes + 1, &back, 4);
+  if(chainJump)
+  {
+    // Preserve the existing hook and its original-function trampoline. Copying
+    // its relative displacement to our new address would jump to the wrong code.
+    tramp[0] = 0xFF;
+    tramp[1] = 0x25;
+    memset(tramp + 2, 0, 4);
+    memcpy(tramp + 6, &previousTarget, sizeof(previousTarget));
+  }
+  else
+  {
+    memcpy(tramp, orig, patchBytes);
+    int32_t back = int32_t((uintptr_t)(orig + patchBytes) -
+                           (uintptr_t)(tramp + patchBytes + 5));
+    tramp[patchBytes] = 0xE9;
+    memcpy(tramp + patchBytes + 1, &back, 4);
+  }
 
   stub[0] = 0xFF;
   stub[1] = 0x25;
@@ -113,28 +161,30 @@ inline bool ApplyExportPatch(HMODULE mod, const ExportPatch &patch)
   memcpy(stub + 6, &patch.hookFn, 8);
 
   DWORD oldProtect = 0;
-  if(!VirtualProtect(orig, patch.prologueBytes, PAGE_EXECUTE_READWRITE, &oldProtect))
+  if(!VirtualProtect(orig, patchBytes, PAGE_EXECUTE_READWRITE, &oldProtect))
   {
     RDCLOG("ExportPatch: VirtualProtect failed on %s!%s", patch.moduleName, patch.exportName);
     VirtualFree(mem, 0, MEM_RELEASE);
     return false;
   }
 
+  // Publish the original call target and flush the trampoline before exposing
+  // the hook entry to other threads.
+  *patch.trampolineOut = tramp;
+  FlushInstructionCache(GetCurrentProcess(), mem, 128);
+
   int32_t fwd = int32_t((uintptr_t)stub - (uintptr_t)(orig + 5));
   orig[0] = 0xE9;
   memcpy(orig + 1, &fwd, 4);
-  for(size_t i = 5; i < patch.prologueBytes; i++)
+  for(size_t i = 5; i < patchBytes; i++)
     orig[i] = 0xCC;
 
-  FlushInstructionCache(GetCurrentProcess(), orig, patch.prologueBytes);
-  FlushInstructionCache(GetCurrentProcess(), mem, 128);
+  FlushInstructionCache(GetCurrentProcess(), orig, patchBytes);
+  VirtualProtect(orig, patchBytes, oldProtect, &oldProtect);
+  installed.push_back({orig, tramp, patch.hookFn});
 
-  VirtualProtect(orig, patch.prologueBytes, oldProtect, &oldProtect);
-
-  if(patch.trampolineOut)
-    *patch.trampolineOut = tramp;
-
-  RDCLOG("ExportPatch: %s!%s patched with hotpatch jump (trampoline %p)", patch.moduleName,
-         patch.exportName, (void *)tramp);
+  RDCLOG("ExportPatch: %s!%s patched (trampoline %p, previous jump target %p)",
+         patch.moduleName, patch.exportName, (void *)tramp, (void *)previousTarget);
   return true;
+#endif
 }
