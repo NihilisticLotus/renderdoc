@@ -1204,6 +1204,94 @@ static rdcstr FindSteamAppID(const rdcstr &app)
   return appID;
 }
 
+// Steam stores the default launch arguments for each launch configuration in its binary
+// appcache/appinfo.vdf.  Launching the executable directly (as RenderDoc normally does) skips
+// that layer, which is observable for games such as FINAL FANTASY XVI: Steam supplies
+// "/graphics dx12" before the user's own launch options.  Recover only the arguments belonging
+// to the selected executable; explicit arguments entered by the user always take precedence.
+static rdcstr FindSteamLaunchArguments(const rdcstr &app, const rdcstr &steamAppID)
+{
+  if(steamAppID.empty())
+    return {};
+
+  char steamPath[32768] = {};
+  DWORD steamPathLen = sizeof(steamPath);
+  LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
+                                RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  if(status != ERROR_SUCCESS)
+  {
+    steamPathLen = sizeof(steamPath);
+    status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+                          "InstallPath", RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  }
+  if(status != ERROR_SUCCESS || steamPath[0] == 0)
+    return {};
+
+  std::ifstream appinfo((rdcstr(steamPath) + "/appcache/appinfo.vdf").c_str(), std::ios::binary);
+  if(!appinfo)
+    return {};
+
+  std::string data((std::istreambuf_iterator<char>(appinfo)), std::istreambuf_iterator<char>());
+  if(data.empty())
+    return {};
+
+  // The app record starts with a binary uint32 AppID. Restrict the search to that record so an
+  // executable with the same name in another Steam title cannot supply unrelated arguments.
+  uint32_t appID = (uint32_t)strtoul(steamAppID.c_str(), NULL, 10);
+  char idBytes[4] = {char(appID & 0xff), char((appID >> 8) & 0xff), char((appID >> 16) & 0xff),
+                     char((appID >> 24) & 0xff)};
+
+  rdcstr exeName = get_basename(app);
+  if(exeName.empty())
+    return {};
+
+  auto equalsIgnoreCase = [](const char *a, const char *b, size_t len) {
+    for(size_t i = 0; i < len; i++)
+    {
+      char ca = a[i], cb = b[i];
+      if(ca >= 'A' && ca <= 'Z') ca = char(ca - 'A' + 'a');
+      if(cb >= 'A' && cb <= 'Z') cb = char(cb - 'A' + 'a');
+      if(ca != cb) return false;
+    }
+    return true;
+  };
+
+  for(size_t record = 0; record + sizeof(idBytes) <= data.size(); record++)
+  {
+    if(memcmp(data.data() + record, idBytes, sizeof(idBytes)) != 0)
+      continue;
+
+    const size_t recordEnd = std::min(data.size(), record + size_t(2 * 1024 * 1024));
+    for(size_t exe = record + sizeof(idBytes); exe + exeName.size() < recordEnd; exe++)
+    {
+      if(!equalsIgnoreCase(data.data() + exe, exeName.c_str(), exeName.size()))
+        continue;
+
+      // Strings in appinfo.vdf are NUL terminated, with a small binary type/tag prefix between
+      // adjacent values. Find the first printable option string following this executable.
+      const size_t scanEnd = std::min(recordEnd, exe + size_t(1024));
+      for(size_t pos = exe + exeName.size(); pos < scanEnd; pos++)
+      {
+        if(data[pos] != '/' && data[pos] != '-')
+          continue;
+
+        size_t end = pos;
+        while(end < scanEnd && data[end] >= 0x20 && data[end] <= 0x7e)
+          end++;
+
+        if(end > pos + 1)
+        {
+          rdcstr args(data.data() + pos, end - pos);
+          RDCLOG("Detected Steam AppInfo launch arguments for %s: %s", app.c_str(), args.c_str());
+          return args;
+        }
+      }
+    }
+  }
+
+  return {};
+}
+
 static bool HasEnvironmentModification(const rdcarray<EnvironmentModification> &env,
                                        const char *name)
 {
@@ -1318,6 +1406,7 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
 
   rdcarray<EnvironmentModification> launchEnv = env;
   rdcstr steamAppID = FindSteamAppID(app);
+  rdcstr launchCmdLine = cmdLine;
   if(!steamAppID.empty())
   {
     if(!HasEnvironmentModification(launchEnv, "SteamAppId"))
@@ -1328,9 +1417,12 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
           EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamGameId", steamAppID));
     RDCLOG("Detected Steam install manifest for %s (AppID %s); supplying Steam runtime variables",
            app.c_str(), steamAppID.c_str());
+
+    if(launchCmdLine.empty())
+      launchCmdLine = FindSteamLaunchArguments(app, steamAppID);
   }
 
-  PROCESS_INFORMATION pi = RunProcess(app, workingDir, cmdLine, launchEnv, false, NULL, NULL);
+  PROCESS_INFORMATION pi = RunProcess(app, workingDir, launchCmdLine, launchEnv, false, NULL, NULL);
 
   if(pi.dwProcessId == 0)
   {
