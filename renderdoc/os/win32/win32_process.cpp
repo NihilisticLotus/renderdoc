@@ -1292,6 +1292,81 @@ static rdcstr FindSteamLaunchArguments(const rdcstr &app, const rdcstr &steamApp
   return {};
 }
 
+static rdcstr FindSteamUserLaunchOptions(const rdcstr &steamAppID)
+{
+  if(steamAppID.empty())
+    return {};
+
+  char steamPath[32768] = {};
+  DWORD steamPathLen = sizeof(steamPath);
+  LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
+                                RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  if(status != ERROR_SUCCESS)
+  {
+    steamPathLen = sizeof(steamPath);
+    status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+                          "InstallPath", RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  }
+  if(status != ERROR_SUCCESS || steamPath[0] == 0)
+    return {};
+
+  const std::string appKey = "\"" + std::string(steamAppID.c_str()) + "\"";
+  rdcstr result;
+  // Enumerate each userdata directory, then read its config file and locate the app block's
+  // LaunchOptions key.
+  rdcwstr userPattern = StringFormat::UTF82Wide(rdcstr(steamPath) + "/userdata/*");
+  WIN32_FIND_DATAW userData = {};
+  HANDLE users = FindFirstFileW(userPattern.c_str(), &userData);
+  if(users == INVALID_HANDLE_VALUE)
+    return {};
+  do
+  {
+    if(!(userData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+       !strcmp(StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)).c_str(), ".") ||
+       !strcmp(StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)).c_str(), ".."))
+      continue;
+
+    rdcstr configPath = rdcstr(steamPath) + "/userdata/" +
+                        StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)) +
+                        "/config/localconfig.vdf";
+    std::ifstream config(configPath.c_str(), std::ios::binary);
+    if(!config)
+      continue;
+    std::string contents((std::istreambuf_iterator<char>(config)), std::istreambuf_iterator<char>());
+
+    size_t appPos = 0;
+    while((appPos = contents.find(appKey, appPos)) != std::string::npos)
+    {
+      size_t blockEnd = contents.find("\n\t\t}", appPos + appKey.size());
+      if(blockEnd == std::string::npos)
+        blockEnd = std::min(contents.size(), appPos + size_t(4096));
+
+      size_t optionPos = contents.find("\"LaunchOptions\"", appPos + appKey.size());
+      if(optionPos != std::string::npos && optionPos < blockEnd)
+      {
+        size_t valueStart = contents.find('"', optionPos + strlen("\"LaunchOptions\""));
+        if(valueStart != std::string::npos && valueStart < blockEnd)
+        {
+          valueStart++;
+          size_t valueEnd = contents.find('"', valueStart);
+          if(valueEnd != std::string::npos && valueEnd <= blockEnd)
+          {
+            result = rdcstr(contents.substr(valueStart, valueEnd - valueStart).c_str());
+            break;
+          }
+        }
+      }
+      appPos += appKey.size();
+    }
+
+    if(!result.empty())
+      break;
+  } while(FindNextFileW(users, &userData));
+  FindClose(users);
+
+  return result;
+}
+
 static bool HasEnvironmentModification(const rdcarray<EnvironmentModification> &env,
                                        const char *name)
 {
@@ -1419,7 +1494,17 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
            app.c_str(), steamAppID.c_str());
 
     if(launchCmdLine.empty())
+    {
       launchCmdLine = FindSteamLaunchArguments(app, steamAppID);
+      rdcstr userOptions = FindSteamUserLaunchOptions(steamAppID);
+      if(!userOptions.empty())
+      {
+        if(!launchCmdLine.empty())
+          launchCmdLine += " ";
+        launchCmdLine += userOptions;
+        RDCLOG("Detected Steam user launch options for %s: %s", app.c_str(), userOptions.c_str());
+      }
+    }
   }
 
   PROCESS_INFORMATION pi = RunProcess(app, workingDir, launchCmdLine, launchEnv, false, NULL, NULL);
