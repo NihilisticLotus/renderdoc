@@ -194,4 +194,25 @@ Replay API 返回成功，统计为 204 个 action、51 次 draw、61 次 dispat
 
 这三项使用同一套标准 Launch 实现，没有给某个游戏增加名称判断或额外启动步骤。
 
+### 2026-09-25 追加的独立证据与边界
+
+- 重新构建了 E: Development 的 `renderdoc.dll`、`rdoc.dll` 和 `qrenderdoc.exe`，并部署到
+  `C:\RenderDocCustom`；三者运行副本与构建副本一致，当前 SHA256 前缀为
+  `61B2BFF7F2AF8EAC2E180A8CAF5CF442342177CBEBF2613BAF8A97F8FF...`。
+- FFXVI 的同一套标准 `ExecuteAndInject` 产生
+  `captures\ffxvi_clean_standard_validation_frame1013.rdc`（780,431,013 字节），目标模块明确
+  为 `C:\RenderDocA\probe\rdoc.dll`，D3D12 presenting=1，回放缩略图为 Square Enix 启动画面，
+  进程未发生启动崩溃。
+- 鬼武者的标准注入产生
+  `captures\onimusha_standard_validation_frame589.rdc`（301,307,393 字节），回放缩略图为
+  游戏着色器优化界面；F12 在目标进程中使 HUD 的捕获计数从 1 增到 2，说明控制端和帧触发均有效。
+- 卡赞的标准注入已进一步用 F12 在真实目标子进程生成
+  `captures\khazan_menu_validation2_frame136027.rdc`（428,964,834 字节），回放缩略图明确显示
+  中文主菜单“新游戏 / 继续 / 加载游戏 / 绝命征途 / 制作人员 / 设置 / 结束”。
+- 本次没有把启动画面、着色器优化界面或自动存档提示误称为主菜单：FFXVI 和鬼武者的当前证据
+  仍是注入/截帧证据，不是主菜单证据。鬼武者在自动存档提示上拒绝了脚本合成的 F/Enter/鼠标
+  输入；该现象发生在游戏 DirectInput/Steam 输入层，不能据此改写 RenderDoc 注入链。
+- 本次构建首次报 LNK1201 时，证据是遗留 `BBQ-Win64-Shipping.exe` 仍加载 `rdoc.dll`；结束该
+  精确子进程后两个项目均成功构建。不能只结束 KZ 父进程就假设所有 RenderDoc 使用者都已退出。
+
 临时 GPU 内存转储、导出函数跳转日志及 Dispatch 标记均已从最终源码移除。
