@@ -67,6 +67,23 @@ TAA，以及原本关闭的帧生成。该设置已保存，下次截帧无需�
    用相同部署的 DLL 和普通 GUI Global Hook 再次捕获后，真实 3D 场景正确回放。
    证据定位到 DLSS 工作未被完整记录，尚未证明具体缺失的是哪个 NVIDIA 私有接口。
 
+### 2026-09-25 标准 ExecuteAndInject 回归
+
+使用 E: Development 构建的 `renderdoccmd.exe`（与 qrenderdoc 共用同一 `renderdoc.dll`），
+通过同一 `RENDERDOC_ExecuteAndInject` 路径重新验证，未启用 Global Hook、未向游戏目录复制 DLL：
+
+- FFXVI：`captures\ffxvi_clean_standard_validation_frame1013.rdc`，780,431,013 字节；
+  D3D12 presenting 成功，缩略图为 Square Enix 启动画面，进程未崩溃。
+- 鬼武者：`captures\onimusha_standard_validation_frame589.rdc`，301,307,393 字节；
+  D3D12 presenting 成功，缩略图为着色器优化界面。
+- 第一狂战士卡赞：`captures\khazan_standard_validation_frame728.rdc`，335,345,858 字节；
+  `KZ.exe` 的 bootstrap 与 `BBQ-Win64-Shipping.exe` 子进程控制端均连接成功，
+  缩略图为补丁说明界面。
+
+这些是“注入、图形拦截、触发截帧”证据，不把启动画面/补丁说明误称为主菜单；要验证主菜单，
+必须在游戏自身完成首次着色器/公告初始化后再输入确认键。冷启动对照中，Steam 根进程残留
+`rdoc.dll` 会让后续直接启动继承旧注入状态，因此诊断前应清理整个 Steam 进程树。
+
 ## 系统接入
 
 - 原 1.45 MSI 已卸载；卸载注册项复查未发现 RenderDoc 1.45。
