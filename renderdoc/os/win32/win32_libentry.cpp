@@ -67,6 +67,10 @@ static BOOL add_hooks()
 
   RDCLOG("Loading into %ls", curFile);
 
+  // Match Nsight's launcher boundary: Steam receives only process tracking hooks, while the
+  // selected game receives the full graphics interception when it is created.
+  LibraryHooks::SetLauncherOnly(f == "steam.exe");
+
   LibraryHooks::RegisterHooks();
 
   return TRUE;

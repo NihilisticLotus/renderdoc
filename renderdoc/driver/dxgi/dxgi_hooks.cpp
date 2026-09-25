@@ -283,7 +283,7 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactoryExport_hook(__in REFIID riid, __out void **ppFactory)
   {
-    RDCLOG("TRACE: CreateDXGIFactory EXPORT patch hit");
+    RDCLOG("TRACE: CreateDXGIFactory EXPORT patch hit riid=%s", ToStr(riid).c_str());
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = s_ExportRealCreateFactory(riid, ppFactory);
@@ -309,7 +309,7 @@ private:
 
   static HRESULT WINAPI CreateDXGIFactory2Export_hook(UINT Flags, REFIID riid, void **ppFactory)
   {
-    RDCLOG("TRACE: CreateDXGIFactory2 EXPORT patch hit");
+    RDCLOG("TRACE: CreateDXGIFactory2 EXPORT patch hit riid=%s", ToStr(riid).c_str());
     if(ppFactory)
       *ppFactory = NULL;
     HRESULT ret = s_ExportRealCreateFactory2(Flags, riid, ppFactory);

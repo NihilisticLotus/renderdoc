@@ -174,7 +174,11 @@ void GetExecutableFilename(rdcstr &selfName)
 void GetLibraryFilename(rdcstr &selfName)
 {
   wchar_t curFile[512] = {0};
-  GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), curFile, 511);
+  HMODULE module = NULL;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     (LPCWSTR)(uintptr_t)&GetLibraryFilename, &module);
+  GetModuleFileNameW(module, curFile, 511);
 
   selfName = StringFormat::Wide2UTF8(curFile);
 }

@@ -814,17 +814,31 @@ public:
 
     wchar_t rdocpath[1024];
 
-    // fetch path to our matching renderdoc.dll
+    // Fetch the host RenderDoc module by address rather than by a fixed filename. The
+    // launcher may ship a byte-identical neutral target copy (rdoc.dll) for games that
+    // explicitly reject the stock renderdoc.dll name.
     HMODULE rdoc = GetModuleHandleA("renderdoc.dll");
+    if(rdoc == NULL)
+      rdoc = GetModuleHandleA("rdoc.dll");
 
     if(rdoc == NULL)
     {
-      std::cerr << "globalhook couldn't find renderdoc.dll!" << std::endl;
+      std::cerr << "globalhook couldn't find the RenderDoc host module!" << std::endl;
       return 1;
     }
 
-    GetModuleFileNameW(rdoc, rdocpath, _countof(rdocpath) - 1);
-    FreeLibrary(rdoc);
+    wchar_t hostpath[1024] = {};
+    GetModuleFileNameW(rdoc, hostpath, _countof(hostpath) - 1);
+    std::wstring host(hostpath);
+    size_t slash = host.find_last_of(L"\\/");
+    std::wstring neutral = host.substr(0, slash == std::wstring::npos ? 0 : slash + 1) + L"rdoc.dll";
+
+    // Prefer the neutral sibling when deployed. Otherwise keep the stock path so an
+    // unmodified development tree remains fully compatible.
+    if(GetFileAttributesW(neutral.c_str()) != INVALID_FILE_ATTRIBUTES)
+      wcsncpy_s(rdocpath, neutral.c_str(), _TRUNCATE);
+    else
+      wcsncpy_s(rdocpath, hostpath, _TRUNCATE);
 
     // Create stdin pipe from parent program, to stay open until requested to close
     HANDLE pipe = GetStdHandle(STD_INPUT_HANDLE);

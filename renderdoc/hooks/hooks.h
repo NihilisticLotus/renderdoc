@@ -146,6 +146,9 @@ class LibraryHooks
 public:
   // generic, implemented in hooks.cpp to iterate over all registered libraries
   static void RegisterHooks();
+  // Keep launcher processes limited to process tracking; graphics hooks belong in the selected app.
+  static void SetLauncherOnly(bool enabled);
+  static bool IsLauncherOnly();
   static void OptionsUpdated();
   static void RemoveHookCallbacks();
 

@@ -32,6 +32,18 @@ static rdcarray<LibraryHook *> &LibList()
   return libs;
 }
 
+static bool s_LauncherOnly = false;
+
+void LibraryHooks::SetLauncherOnly(bool enabled)
+{
+  s_LauncherOnly = enabled;
+}
+
+bool LibraryHooks::IsLauncherOnly()
+{
+  return s_LauncherOnly;
+}
+
 LibraryHook::LibraryHook()
 {
   LibList().push_back(this);

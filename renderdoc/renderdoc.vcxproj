@@ -907,6 +907,9 @@ namespace DXCEnumerateAndCheck {
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="AfterBuild" AfterTargets="Build">
+    <!-- FFXVI rejects the stock renderdoc.dll filename. Keep a neutral target copy beside the
+         host DLL; Launch/ExecuteAndInject selects it automatically when present. -->
+    <Copy SourceFiles="$(TargetPath)" DestinationFiles="$(OutDir)rdoc.dll" SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(ProjectDir)api\app\renderdoc_app.h" DestinationFolder="$(OutDir)">
     </Copy>
     <Copy SourceFiles="$(ProjectDir)3rdparty\dbghelp\$(Platform)\symsrv.dll" DestinationFolder="$(OutDir)">

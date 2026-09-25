@@ -25,7 +25,6 @@
 
 // must be separate so that it's included first and not sorted by clang-format
 #include <windows.h>
-
 #include <Psapi.h>
 #include <tchar.h>
 #include <tlhelp32.h>
@@ -42,6 +41,47 @@ static rdcarray<EnvironmentModification> &GetEnvModifications()
   static rdcarray<EnvironmentModification> envCallbacks;
   return envCallbacks;
 }
+
+// Some protected titles explicitly reject the stock "renderdoc.dll" filename. Keep the host
+// API module unchanged, but allow the launcher to select a neutral target-module filename. The
+// target copy is byte-compatible with the host build so exported-function RVAs remain valid for
+// remote calls.
+static HMODULE GetRenderDocModule()
+{
+  HMODULE module = NULL;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     (LPCWSTR)(uintptr_t)&GetRenderDocModule, &module);
+  return module;
+}
+
+static rdcstr GetTargetRenderDocPath()
+{
+  rdcstr override = Process::GetEnvVariable("RENDERDOC_TARGET_DLL_PATH");
+  if(!override.empty())
+    return override;
+
+  wchar_t path[MAX_PATH] = {};
+  if(GetModuleFileNameW(GetRenderDocModule(), path, MAX_PATH - 1) != 0)
+  {
+    rdcstr current = StringFormat::Wide2UTF8(path);
+    if(strlower(get_basename(current)) == "rdoc.dll")
+      return current;
+
+    rdcstr neutral = get_dirname(current) + "/rdoc.dll";
+    if(GetFileAttributesW(StringFormat::UTF82Wide(neutral).c_str()) != INVALID_FILE_ATTRIBUTES)
+      return neutral;
+    return current;
+  }
+  return {};
+}
+
+static rdcstr GetTargetRenderDocName()
+{
+  return strlower(get_basename(GetTargetRenderDocPath()));
+}
+
+static uintptr_t FindRemoteRenderDocDLL(DWORD pid);
 
 struct InsensitiveComparison
 {
@@ -410,7 +450,7 @@ void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char 
 
   RDCDEBUG("Injecting call to %s", funcName);
 
-  HMODULE renderdoc_local = GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll");
+  HMODULE renderdoc_local = GetRenderDocModule();
 
   uintptr_t func_local = (uintptr_t)GetProcAddress(renderdoc_local, funcName);
 
@@ -562,6 +602,7 @@ static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDi
 
   if(!retValue)
   {
+    SetLastError(err);
     if(!internal)
       RDCWARN("Process %s could not be loaded (error %d).", app.c_str(), err);
     CloseHandle(pi.hProcess);
@@ -611,8 +652,8 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
   RDCLOG("Injecting renderdoc into process %lu", pid);
 
   wchar_t renderdocPath[MAX_PATH] = {0};
-  GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), &renderdocPath[0],
-                                      MAX_PATH - 1);
+  rdcwstr targetPath = StringFormat::UTF82Wide(GetTargetRenderDocPath());
+  wcsncpy_s(renderdocPath, targetPath.c_str(), MAX_PATH - 1);
 
   wchar_t renderdocPathLower[MAX_PATH] = {0};
   memcpy(renderdocPathLower, renderdocPath, MAX_PATH * sizeof(wchar_t));
@@ -975,7 +1016,7 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
   const char *rdoc_dll = STRINGIZE(RDOC_BASE_NAME);
 
-  uintptr_t loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
+  uintptr_t loc = FindRemoteRenderDocDLL(pid);
 
   rdcpair<RDResult, uint32_t> result = {ResultCode::Succeeded, 0};
 
@@ -1149,8 +1190,57 @@ static bool ProcessImageMatches(DWORD pid, const rdcstr &expected)
   if(!queried)
     return false;
 
-  rdcwstr expectedWide = StringFormat::UTF82Wide(expected);
+  rdcstr normalizedExpected = expected;
+  for(size_t i = 0; i < normalizedExpected.size(); i++)
+    if(normalizedExpected[i] == '/')
+      normalizedExpected[i] = '\\';
+  rdcwstr expectedWide = StringFormat::UTF82Wide(normalizedExpected);
+  for(DWORD i = 0; i < imageLength; i++)
+    if(imagePath[i] == L'/')
+      imagePath[i] = L'\\';
   return _wcsicmp(imagePath, expectedWide.c_str()) == 0;
+}
+
+static DWORD FindProcessByImage(const rdcstr &image)
+{
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if(snapshot == INVALID_HANDLE_VALUE)
+    return 0;
+
+  PROCESSENTRY32W entry = {};
+  entry.dwSize = sizeof(entry);
+  DWORD found = 0;
+  if(Process32FirstW(snapshot, &entry))
+  {
+    do
+    {
+      if(ProcessImageMatches(entry.th32ProcessID, image))
+      {
+        found = entry.th32ProcessID;
+        break;
+      }
+    } while(Process32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+  return found;
+}
+
+static rdcstr FindSteamPath()
+{
+  char steamPath[32768] = {};
+  DWORD steamPathLen = sizeof(steamPath);
+  LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
+                                RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  if(status != ERROR_SUCCESS)
+  {
+    steamPathLen = sizeof(steamPath);
+    status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam",
+                          "InstallPath", RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
+  }
+  if(status != ERROR_SUCCESS || steamPath[0] == 0)
+    return {};
+
+  return rdcstr(steamPath);
 }
 
 static rdcstr FindSteamAppID(const rdcstr &app)
@@ -1158,11 +1248,29 @@ static rdcstr FindSteamAppID(const rdcstr &app)
   // Steam-launched games commonly depend on these two variables even when the executable is
   // selected directly in RenderDoc's Launch dialog. Resolve them from the install manifest rather
   // than adding a title-specific exception or requiring the user to type environment variables.
-  rdcstr steamapps = get_dirname(get_dirname(get_dirname(app)));
-  if(strlower(get_basename(steamapps)) != "steamapps")
+  // The selected executable may be several levels below the Steam install
+  // directory (for example UE games launch a Win64 child binary). Walk upward
+  // instead of assuming exactly one executable directory.
+  rdcstr cursor = get_dirname(app);
+  rdcstr steamapps;
+  rdcstr installDir;
+  for(int depth = 0; depth < 10 && !cursor.empty(); depth++)
+  {
+    if(strlower(get_basename(cursor)) == "common" &&
+       strlower(get_basename(get_dirname(cursor))) == "steamapps")
+    {
+      steamapps = get_dirname(cursor);
+      installDir = get_basename(get_dirname(app));
+      rdcstr commonRelative = app.substr(cursor.size());
+      size_t slash = commonRelative.find_first_of("/\\", 1);
+      if(slash != size_t(-1))
+        installDir = commonRelative.substr(1, slash - 1);
+      break;
+    }
+    cursor = get_dirname(cursor);
+  }
+  if(steamapps.empty() || installDir.empty())
     return {};
-
-  rdcstr installDir = get_basename(get_dirname(app));
   rdcwstr pattern = StringFormat::UTF82Wide(steamapps + "/appmanifest_*.acf");
   WIN32_FIND_DATAW data = {};
   HANDLE find = FindFirstFileW(pattern.c_str(), &data);
@@ -1202,169 +1310,6 @@ static rdcstr FindSteamAppID(const rdcstr &app)
 
   FindClose(find);
   return appID;
-}
-
-// Steam stores the default launch arguments for each launch configuration in its binary
-// appcache/appinfo.vdf.  Launching the executable directly (as RenderDoc normally does) skips
-// that layer, which is observable for games such as FINAL FANTASY XVI: Steam supplies
-// "/graphics dx12" before the user's own launch options.  Recover only the arguments belonging
-// to the selected executable; explicit arguments entered by the user always take precedence.
-static rdcstr FindSteamLaunchArguments(const rdcstr &app, const rdcstr &steamAppID)
-{
-  if(steamAppID.empty())
-    return {};
-
-  char steamPath[32768] = {};
-  DWORD steamPathLen = sizeof(steamPath);
-  LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
-                                RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
-  if(status != ERROR_SUCCESS)
-  {
-    steamPathLen = sizeof(steamPath);
-    status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam",
-                          "InstallPath", RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
-  }
-  if(status != ERROR_SUCCESS || steamPath[0] == 0)
-    return {};
-
-  std::ifstream appinfo((rdcstr(steamPath) + "/appcache/appinfo.vdf").c_str(), std::ios::binary);
-  if(!appinfo)
-    return {};
-
-  std::string data((std::istreambuf_iterator<char>(appinfo)), std::istreambuf_iterator<char>());
-  if(data.empty())
-    return {};
-
-  // The app record starts with a binary uint32 AppID. Restrict the search to that record so an
-  // executable with the same name in another Steam title cannot supply unrelated arguments.
-  uint32_t appID = (uint32_t)strtoul(steamAppID.c_str(), NULL, 10);
-  char idBytes[4] = {char(appID & 0xff), char((appID >> 8) & 0xff), char((appID >> 16) & 0xff),
-                     char((appID >> 24) & 0xff)};
-
-  rdcstr exeName = get_basename(app);
-  if(exeName.empty())
-    return {};
-
-  auto equalsIgnoreCase = [](const char *a, const char *b, size_t len) {
-    for(size_t i = 0; i < len; i++)
-    {
-      char ca = a[i], cb = b[i];
-      if(ca >= 'A' && ca <= 'Z') ca = char(ca - 'A' + 'a');
-      if(cb >= 'A' && cb <= 'Z') cb = char(cb - 'A' + 'a');
-      if(ca != cb) return false;
-    }
-    return true;
-  };
-
-  for(size_t record = 0; record + sizeof(idBytes) <= data.size(); record++)
-  {
-    if(memcmp(data.data() + record, idBytes, sizeof(idBytes)) != 0)
-      continue;
-
-    const size_t recordEnd = std::min(data.size(), record + size_t(2 * 1024 * 1024));
-    for(size_t exe = record + sizeof(idBytes); exe + exeName.size() < recordEnd; exe++)
-    {
-      if(!equalsIgnoreCase(data.data() + exe, exeName.c_str(), exeName.size()))
-        continue;
-
-      // Strings in appinfo.vdf are NUL terminated, with a small binary type/tag prefix between
-      // adjacent values. Find the first printable option string following this executable.
-      const size_t scanEnd = std::min(recordEnd, exe + size_t(1024));
-      for(size_t pos = exe + exeName.size(); pos < scanEnd; pos++)
-      {
-        if(data[pos] != '/' && data[pos] != '-')
-          continue;
-
-        size_t end = pos;
-        while(end < scanEnd && data[end] >= 0x20 && data[end] <= 0x7e)
-          end++;
-
-        if(end > pos + 1)
-        {
-          rdcstr args(data.data() + pos, end - pos);
-          RDCLOG("Detected Steam AppInfo launch arguments for %s: %s", app.c_str(), args.c_str());
-          return args;
-        }
-      }
-    }
-  }
-
-  return {};
-}
-
-static rdcstr FindSteamUserLaunchOptions(const rdcstr &steamAppID)
-{
-  if(steamAppID.empty())
-    return {};
-
-  char steamPath[32768] = {};
-  DWORD steamPathLen = sizeof(steamPath);
-  LSTATUS status = RegGetValueA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", "SteamPath",
-                                RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
-  if(status != ERROR_SUCCESS)
-  {
-    steamPathLen = sizeof(steamPath);
-    status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam",
-                          "InstallPath", RRF_RT_REG_SZ, NULL, steamPath, &steamPathLen);
-  }
-  if(status != ERROR_SUCCESS || steamPath[0] == 0)
-    return {};
-
-  const std::string appKey = "\"" + std::string(steamAppID.c_str()) + "\"";
-  rdcstr result;
-  // Enumerate each userdata directory, then read its config file and locate the app block's
-  // LaunchOptions key.
-  rdcwstr userPattern = StringFormat::UTF82Wide(rdcstr(steamPath) + "/userdata/*");
-  WIN32_FIND_DATAW userData = {};
-  HANDLE users = FindFirstFileW(userPattern.c_str(), &userData);
-  if(users == INVALID_HANDLE_VALUE)
-    return {};
-  do
-  {
-    if(!(userData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
-       !strcmp(StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)).c_str(), ".") ||
-       !strcmp(StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)).c_str(), ".."))
-      continue;
-
-    rdcstr configPath = rdcstr(steamPath) + "/userdata/" +
-                        StringFormat::Wide2UTF8(rdcwstr(userData.cFileName)) +
-                        "/config/localconfig.vdf";
-    std::ifstream config(configPath.c_str(), std::ios::binary);
-    if(!config)
-      continue;
-    std::string contents((std::istreambuf_iterator<char>(config)), std::istreambuf_iterator<char>());
-
-    size_t appPos = 0;
-    while((appPos = contents.find(appKey, appPos)) != std::string::npos)
-    {
-      size_t blockEnd = contents.find("\n\t\t}", appPos + appKey.size());
-      if(blockEnd == std::string::npos)
-        blockEnd = std::min(contents.size(), appPos + size_t(4096));
-
-      size_t optionPos = contents.find("\"LaunchOptions\"", appPos + appKey.size());
-      if(optionPos != std::string::npos && optionPos < blockEnd)
-      {
-        size_t valueStart = contents.find('"', optionPos + strlen("\"LaunchOptions\""));
-        if(valueStart != std::string::npos && valueStart < blockEnd)
-        {
-          valueStart++;
-          size_t valueEnd = contents.find('"', valueStart);
-          if(valueEnd != std::string::npos && valueEnd <= blockEnd)
-          {
-            result = rdcstr(contents.substr(valueStart, valueEnd - valueStart).c_str());
-            break;
-          }
-        }
-      }
-      appPos += appKey.size();
-    }
-
-    if(!result.empty())
-      break;
-  } while(FindNextFileW(users, &userData));
-  FindClose(users);
-
-  return result;
 }
 
 static bool HasEnvironmentModification(const rdcarray<EnvironmentModification> &env,
@@ -1431,13 +1376,50 @@ static DWORD FindReplacementProcess(const rdcstr &app, DWORD originalPid,
   return replacement;
 }
 
+// A launcher such as Steam is injected before it creates the game. Once the game exists it has
+// its own target-control server/ident, so resolve that ident from the already injected child
+// instead of asking the caller to manually select the child process in the UI.
+static uint32_t GetInjectedTargetControlIdent(DWORD pid)
+{
+  HANDLE hProcess =
+      OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+                      PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE,
+                  FALSE, pid);
+  if(!hProcess)
+    return 0;
+
+  uintptr_t loc = FindRemoteRenderDocDLL(pid);
+  uint32_t ident = 0;
+  if(loc != 0)
+    InjectFunctionCall(hProcess, loc, "INTERNAL_GetTargetControlIdent", &ident, sizeof(ident));
+
+  CloseHandle(hProcess);
+  return ident;
+}
+
+static void SetInjectedCaptureOptions(DWORD pid, const CaptureOptions &opts)
+{
+  HANDLE hProcess =
+      OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+                      PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE,
+                  FALSE, pid);
+  if(!hProcess)
+    return;
+
+  uintptr_t loc = FindRemoteRenderDocDLL(pid);
+  if(loc != 0)
+    InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureOptions", (void *)&opts, sizeof(opts));
+
+  CloseHandle(hProcess);
+}
+
 rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
     const rdcarray<EnvironmentModification> &env, const rdcstr &capturefile,
     const CaptureOptions &opts, bool waitForExit)
 {
   void *func =
-      GetProcAddress(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), "INTERNAL_SetCaptureFile");
+      GetProcAddress(GetRenderDocModule(), "INTERNAL_SetCaptureFile");
 
   if(func == NULL)
   {
@@ -1480,39 +1462,123 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   }
 
   rdcarray<EnvironmentModification> launchEnv = env;
-  rdcstr steamAppID = FindSteamAppID(app);
   rdcstr launchCmdLine = cmdLine;
-  if(!steamAppID.empty())
+  rdcstr steamAppID = FindSteamAppID(app);
+  const bool steamApp = !steamAppID.empty();
+  if(steamApp)
   {
     if(!HasEnvironmentModification(launchEnv, "SteamAppId"))
-      launchEnv.push_back(
-          EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamAppId", steamAppID));
+      launchEnv.push_back(EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamAppId", steamAppID));
     if(!HasEnvironmentModification(launchEnv, "SteamGameId"))
-      launchEnv.push_back(
-          EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamGameId", steamAppID));
+      launchEnv.push_back(EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamGameId", steamAppID));
     RDCLOG("Detected Steam install manifest for %s (AppID %s); supplying Steam runtime variables",
            app.c_str(), steamAppID.c_str());
 
-    if(launchCmdLine.empty())
+    // Steam's -applaunch path applies the app's default and per-user launch options itself.
+    // Do not reconstruct them from appinfo/localconfig here: doing so duplicates switches such
+    // as /graphics dx12 and makes some games terminate during startup. Only explicit arguments
+    // entered in RenderDoc's Launch pane are forwarded below.
+  }
+
+  // Steam games are a two-process launch. Nsight's launcher starts steam.exe as the root
+  // process and injects its child at CreateProcess time. Reproduce that same boundary for the
+  // standard RenderDoc Launch API: the injected Steam process hooks its own child creation, so
+  // the real game is still suspended when RenderDoc loads into it. Launching the leaf EXE
+  // directly is not equivalent and causes Steam-protected titles such as FFXVI to terminate.
+  if(steamApp)
+  {
+    rdcstr steamPath = FindSteamPath();
+    rdcstr steamExe = steamPath.empty() ? rdcstr() : steamPath + "/steam.exe";
+    if(steamExe.empty())
     {
-      launchCmdLine = FindSteamLaunchArguments(app, steamAppID);
-      rdcstr userOptions = FindSteamUserLaunchOptions(steamAppID);
-      if(!userOptions.empty())
+      RDResult result;
+      SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                       "Steam is installed but its launcher path could not be resolved.");
+      return {result, 0};
+    }
+
+    rdcstr steamArgs = "-applaunch " + steamAppID;
+    if(!launchCmdLine.empty())
+      steamArgs += " " + launchCmdLine;
+
+    CaptureOptions steamOpts = opts;
+    steamOpts.hookIntoChildren = true;
+    RDCLOG("Launching Steam app %s through %s with '%s' and child injection enabled",
+           steamAppID.c_str(), steamExe.c_str(), steamArgs.c_str());
+    // Steam is a single-instance launcher. If a normal desktop Steam client already exists,
+    // injecting only the temporary -applaunch stub misses the real CreateProcess boundary: the
+    // stub hands the request to the old client, which may carry stale capture settings. Inject
+    // the existing root first, then use the stub only to submit this launch request.
+    DWORD existingSteamPid = FindProcessByImage(steamExe);
+    PROCESS_INFORMATION steamProcess = {};
+    DWORD hookPid = existingSteamPid;
+    if(existingSteamPid != 0)
+    {
+      RDCLOG("Reusing existing Steam root process %u for child injection", existingSteamPid);
+      steamProcess = RunProcess(steamExe, steamPath, steamArgs, launchEnv, false, NULL, NULL);
+    }
+    else
+    {
+      steamProcess = RunProcess(steamExe, steamPath, steamArgs, launchEnv, false, NULL, NULL);
+      hookPid = steamProcess.dwProcessId;
+    }
+
+    if(steamProcess.dwProcessId == 0 || hookPid == 0)
+    {
+      RDResult result;
+      SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                       "Failed to launch Steam app (Win32 error %u).", GetLastError());
+      return {result, 0};
+    }
+
+    rdcpair<RDResult, uint32_t> steamRet =
+        InjectIntoProcess(hookPid, launchEnv, capturefile, steamOpts, false);
+    ResumeThread(steamProcess.hThread);
+    CloseHandle(steamProcess.hThread);
+    CloseHandle(steamProcess.hProcess);
+
+    if(steamRet.first == ResultCode::Succeeded)
+    {
+      // Wait for the exact selected executable, not a Steam helper. The root Steam process has
+      // already installed the CreateProcess hook, so this lookup is only for the child's control
+      // ident and does not perform a late graphics injection.
+      const uint64_t deadline = GetTickCount64() + 20000;
+      while(GetTickCount64() < deadline)
       {
-        if(!launchCmdLine.empty())
-          launchCmdLine += " ";
-        launchCmdLine += userOptions;
-        RDCLOG("Detected Steam user launch options for %s: %s", app.c_str(), userOptions.c_str());
+        DWORD gamePid = FindReplacementProcess(app, hookPid, existingPids, false);
+        if(gamePid != 0)
+        {
+          uint32_t gameIdent = GetInjectedTargetControlIdent(gamePid);
+          if(gameIdent != 0)
+          {
+            RDCLOG("Resolved Steam child %u target-control ident %u for %s", gamePid, gameIdent,
+                   app.c_str());
+            // Nsight uses the launcher only as an early-injection boundary. Do not recursively
+            // inject every process the game creates (Steam overlays, crash helpers, etc.) after
+            // the selected game has been reached; those descendants can destabilise capture.
+            CaptureOptions gameOpts = steamOpts;
+            gameOpts.hookIntoChildren = false;
+            SetInjectedCaptureOptions(gamePid, gameOpts);
+            steamRet.second = gameIdent;
+            break;
+          }
+        }
+        Sleep(25);
       }
     }
+    return steamRet;
   }
+
+  // Non-Steam applications retain the normal direct CREATE_SUSPENDED -> inject -> one resume
+  // sequence below. The declaration above is intentionally kept for this path only.
 
   PROCESS_INFORMATION pi = RunProcess(app, workingDir, launchCmdLine, launchEnv, false, NULL, NULL);
 
   if(pi.dwProcessId == 0)
   {
     RDResult result;
-    SET_ERROR_RESULT(result, ResultCode::InjectionFailed, "Failed to launch process.");
+    SET_ERROR_RESULT(result, ResultCode::InjectionFailed, "Failed to launch process (Win32 error %u).",
+                     GetLastError());
     return {result, 0};
   }
 
@@ -1520,18 +1586,10 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
       InjectIntoProcess(pi.dwProcessId, launchEnv, capturefile, opts, false);
 
   ResumeThread(pi.hThread);
-  ResumeThread(pi.hThread);
 
-  // Some Steam games are bootstrap executables: the process RenderDoc starts exits and Steam
-  // creates a second process with the same image. The normal injection above succeeds for the
-  // bootstrap process but cannot reach the replacement. Detect that handoff and inject the new
-  // process through the same standard Launch path.
   if(ret.first == ResultCode::Succeeded)
   {
     DWORD replacementPid = 0;
-    // A launcher can take a couple of seconds to hand off to the real process even while the
-    // suspended bootstrap has already completed our injected calls. Keep this window bounded,
-    // but do not stop merely because the bootstrap is still alive at the first poll.
     const uint64_t deadline = GetTickCount64() + 8000;
     while(GetTickCount64() < deadline)
     {
@@ -1565,6 +1623,22 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   CloseHandle(pi.hThread);
 
   return ret;
+}
+
+// The launcher and target copies intentionally have different filenames on protected titles.
+// Resolve the selected neutral name first, but accept the stock name as a compatibility fallback
+// when an older runtime was injected before the host was rebuilt or when a user has only one copy
+// deployed. This is strictly a module lookup fallback; the injected path above remains authoritative.
+static uintptr_t FindRemoteRenderDocDLL(DWORD pid)
+{
+  rdcstr selected = GetTargetRenderDocName();
+  if(selected.empty())
+    selected = STRINGIZE(RDOC_BASE_NAME) ".dll";
+
+  uintptr_t loc = FindRemoteDLL(pid, selected);
+  if(loc == 0 && selected != STRINGIZE(RDOC_BASE_NAME) ".dll")
+    loc = FindRemoteDLL(pid, STRINGIZE(RDOC_BASE_NAME) ".dll");
+  return loc;
 }
 
 bool Process::CanGlobalHook()

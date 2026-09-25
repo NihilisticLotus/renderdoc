@@ -331,11 +331,34 @@ private:
 
     bool inject = true;
 
+    // Steam is a launcher with a large CEF/service process tree. Nsight's target settings
+    // explicitly ignore these helpers; injecting RenderDoc into them adds no graphics capture
+    // value and can race their very short startup/teardown window, preventing the real game
+    // child from being launched. Keep the filter name-based and leave the selected game process
+    // untouched.
+    auto isIgnoredLauncher = [](const rdcstr &text) {
+      static const char *const ignored[] = {
+          "steamwebhelper.exe",       "steamsysinfo.exe",      "steamservice.exe",
+          "steamerrorreporter.exe",  "steamerrorreporter64.exe", "gameoverlayui.exe",
+          "gameoverlayui64.exe",      "crashreport.exe",        "crashreportclient.exe",
+          "crashreporter.exe",        "crashpad_handler.exe",   "nvngx_update.exe",
+          "unitycrashhandler64.exe",  "vulkandriverquery.exe",   "vulkandriverquery64.exe",
+          "gldriverquery.exe",        "gldriverquery64.exe",     "hardwareupdater.exe",
+      };
+      for(const char *name : ignored)
+        if(text.contains(name))
+          return true;
+      return false;
+    };
+
     // sanity check to make sure we're not going to go into an infinity loop injecting into
     // ourselves.
     if(lpApplicationName)
     {
       rdcstr app = strlower(StringFormat::Wide2UTF8(lpApplicationName));
+
+      if(isIgnoredLauncher(app))
+        inject = false;
 
       if(app.contains("renderdoccmd.exe") || app.contains("qrenderdoc.exe"))
       {
@@ -345,6 +368,9 @@ private:
     if(lpCommandLine)
     {
       rdcstr cmd = strlower(StringFormat::Wide2UTF8(lpCommandLine));
+
+      if(isIgnoredLauncher(cmd))
+        inject = false;
 
       if(cmd.contains("renderdoccmd.exe") || cmd.contains("qrenderdoc.exe"))
       {

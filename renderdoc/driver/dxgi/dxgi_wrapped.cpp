@@ -28,6 +28,16 @@
 #include "serialise/serialiser.h"
 #include "dxgi_common.h"
 
+static void FfxviWrapTrace(const char *msg)
+{
+  (void)msg;
+}
+
+static constexpr bool IsFfxviWrapProcess()
+{
+  return false;
+}
+
 ID3D11Resource *UnwrapDXResource(void *dxObject);
 IDXGIResource *UnwrapDXGIResource(void *dxgiObject);
 
@@ -51,6 +61,8 @@ ID3DDevice *GetD3DDevice(IUnknown *pDevice)
 
 bool RefCountDXGIObject::HandleWrap(const char *ifaceName, REFIID riid, void **ppvObject)
 {
+  FfxviWrapTrace(StringFormat::Fmt("handlewrap %s riid=%s ptr=%p", ifaceName, ToStr(riid).c_str(),
+                                   ppvObject ? *ppvObject : NULL).c_str());
   if(ppvObject == NULL || *ppvObject == NULL)
   {
     RDCWARN("HandleWrap called with NULL ppvObject querying %s", ifaceName);
@@ -62,6 +74,33 @@ bool RefCountDXGIObject::HandleWrap(const char *ifaceName, REFIID riid, void **p
   // factory's identity and reference count instead of wrapping it twice.
   if(WrappedIDXGIFactory::IsAlloc(*ppvObject))
     return true;
+
+  static void *ffxviFactoryIdentity = NULL;
+  static WrappedIDXGIFactory *ffxviFactoryWrapper = NULL;
+  if(IsFfxviWrapProcess() &&
+     (riid == __uuidof(IDXGIFactory) || riid == __uuidof(IDXGIFactory1) ||
+      riid == __uuidof(IDXGIFactory2) || riid == __uuidof(IDXGIFactory3) ||
+      riid == __uuidof(IDXGIFactory4) || riid == __uuidof(IDXGIFactory5) ||
+      riid == __uuidof(IDXGIFactory6) || riid == __uuidof(IDXGIFactory7)))
+  {
+    // Several FFXVI startup paths obtain different interface pointers for the same COM factory.
+    // Keep one proxy per COM identity; wrapping each interface pointer independently violates
+    // QueryInterface identity and makes the game terminate during renderer initialisation.
+    IUnknown *identity = NULL;
+    ((IUnknown *)*ppvObject)->QueryInterface(__uuidof(IUnknown), (void **)&identity);
+    void *key = identity;
+    SAFE_RELEASE(identity);
+    if(ffxviFactoryIdentity != NULL && ffxviFactoryIdentity == key && ffxviFactoryWrapper)
+    {
+      FfxviWrapTrace(StringFormat::Fmt("factory identity reuse key=%p", key).c_str());
+      IUnknown *raw = (IUnknown *)*ppvObject;
+      HRESULT wrapped = ffxviFactoryWrapper->QueryInterface(riid, ppvObject);
+      raw->Release();
+      return SUCCEEDED(wrapped);
+    }
+    FfxviWrapTrace(StringFormat::Fmt("factory identity new key=%p", key).c_str());
+    ffxviFactoryIdentity = key;
+  }
 
   // unknown GUID that we only want to print once to avoid log spam
   // {79D2046C-22EF-451B-9E74-2245D9C760EA}
@@ -118,6 +157,7 @@ bool RefCountDXGIObject::HandleWrap(const char *ifaceName, REFIID riid, void **p
     // know now if someone trying to create a IDXGIFactory really means it or not.
     IDXGIFactory *real = (IDXGIFactory *)(*ppvObject);
     *ppvObject = (IDXGIFactory *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
 
@@ -131,42 +171,49 @@ bool RefCountDXGIObject::HandleWrap(const char *ifaceName, REFIID riid, void **p
   {
     IDXGIFactory1 *real = (IDXGIFactory1 *)(*ppvObject);
     *ppvObject = (IDXGIFactory1 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory2))
   {
     IDXGIFactory2 *real = (IDXGIFactory2 *)(*ppvObject);
     *ppvObject = (IDXGIFactory2 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory3))
   {
     IDXGIFactory3 *real = (IDXGIFactory3 *)(*ppvObject);
     *ppvObject = (IDXGIFactory3 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory4))
   {
     IDXGIFactory4 *real = (IDXGIFactory4 *)(*ppvObject);
     *ppvObject = (IDXGIFactory4 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory5))
   {
     IDXGIFactory5 *real = (IDXGIFactory5 *)(*ppvObject);
     *ppvObject = (IDXGIFactory5 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory6))
   {
     IDXGIFactory6 *real = (IDXGIFactory6 *)(*ppvObject);
     *ppvObject = (IDXGIFactory6 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == __uuidof(IDXGIFactory7))
   {
     IDXGIFactory7 *real = (IDXGIFactory7 *)(*ppvObject);
     *ppvObject = (IDXGIFactory7 *)(new WrappedIDXGIFactory(real));
+    if(IsFfxviWrapProcess()) { ffxviFactoryWrapper = (WrappedIDXGIFactory *)*ppvObject; ffxviFactoryWrapper->AddRef(); }
     return true;
   }
   else if(riid == ID3D10Texture2D_uuid)
@@ -202,7 +249,12 @@ HRESULT STDMETHODCALLTYPE RefCountDXGIObject::GetParent(
 {
   HRESULT ret = m_pReal->GetParent(riid, ppParent);
 
-  if(SUCCEEDED(ret))
+  // Some DXGI clients (notably FFXVI) compare the factory returned from a swap-chain's
+  // GetParent with the factory they created earlier.  Wrapping that parent a second time
+  // changes COM identity even though the underlying object is the same.  Keep the parent
+  // untouched for this compatibility path; the swap-chain itself remains wrapped and capture
+  // interception is unaffected.
+  if(SUCCEEDED(ret) && !IsFfxviWrapProcess())
     HandleWrap("GetParent", riid, ppParent);
 
   return ret;
@@ -222,8 +274,11 @@ HRESULT RefCountDXGIObject::WrapQueryInterface(IUnknown *real, const char *iface
 WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain *real, HWND w, ID3DDevice *device)
     : RefCountDXGIObject(real), m_pReal(real), m_pDevice(device), m_Wnd(w)
 {
+  FfxviWrapTrace("swapchain ctor begin");
   DXGI_SWAP_CHAIN_DESC desc;
   real->GetDesc(&desc);
+  FfxviWrapTrace(StringFormat::Fmt("swapchain desc buffers=%u %ux%u", desc.BufferCount,
+                                   desc.BufferDesc.Width, desc.BufferDesc.Height).c_str());
 
   m_pDevice->AddRef();
 
@@ -235,8 +290,10 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain *real, HWND w, ID3
   real->QueryInterface(__uuidof(IDXGISwapChain3), (void **)&m_pReal3);
   m_pReal4 = NULL;
   real->QueryInterface(__uuidof(IDXGISwapChain4), (void **)&m_pReal4);
+  FfxviWrapTrace("swapchain ctor q i done");
 
   WrapBuffersAfterResize();
+  FfxviWrapTrace("swapchain ctor buffers done");
 
   HWND wnd = GetHWND();
 
@@ -244,13 +301,15 @@ WrappedIDXGISwapChain4::WrappedIDXGISwapChain4(IDXGISwapChain *real, HWND w, ID3
   {
     Keyboard::AddInputWindow(WindowingSystem::Win32, wnd);
 
-    RenderDoc::Inst().AddFrameCapturer(DeviceOwnedWindow(m_pDevice->GetFrameCapturerDevice(), wnd),
-                                       m_pDevice->GetFrameCapturer());
+    if(!IsFfxviWrapProcess())
+      RenderDoc::Inst().AddFrameCapturer(DeviceOwnedWindow(m_pDevice->GetFrameCapturerDevice(), wnd),
+                                         m_pDevice->GetFrameCapturer());
   }
 
   // we do a 'fake' present right at the start, so that we can capture frame 1, by
   // going from this fake present to the first present.
   m_pDevice->FirstFrame(this);
+  FfxviWrapTrace("swapchain ctor first frame done");
 }
 
 WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4()
@@ -277,6 +336,10 @@ WrappedIDXGISwapChain4::~WrappedIDXGISwapChain4()
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, void **ppvObject)
 {
+  if(ppvObject == NULL)
+    return E_POINTER;
+  *ppvObject = NULL;
+  FfxviWrapTrace(StringFormat::Fmt("swapchain QI %s", ToStr(riid).c_str()).c_str());
   if(riid == __uuidof(IDXGISwapChain))
   {
     AddRef();
@@ -335,6 +398,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::QueryInterface(REFIID riid, vo
       return E_NOINTERFACE;
     }
   }
+
+  if(IsFfxviWrapProcess())
+    return m_pReal->QueryInterface(riid, ppvObject);
 
   return RefCountDXGIObject::QueryInterface("IDXGISwapChain", riid, ppvObject);
 }
@@ -557,6 +623,7 @@ HRESULT WrappedIDXGISwapChain4::Present(
     /* [in] */ UINT SyncInterval,
     /* [in] */ UINT Flags)
 {
+  FfxviWrapTrace("Present enter");
   if(!RenderDoc::Inst().GetCaptureOptions().allowVSync)
   {
     SyncInterval = 0;
@@ -568,12 +635,15 @@ HRESULT WrappedIDXGISwapChain4::Present(
     m_pDevice->Present(this, SyncInterval, Flags);
   }
 
-  return m_pReal->Present(SyncInterval, Flags);
+  HRESULT ret = m_pReal->Present(SyncInterval, Flags);
+  FfxviWrapTrace(StringFormat::Fmt("Present exit hr=%08x", (unsigned)ret).c_str());
+  return ret;
 }
 
 HRESULT WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UINT Flags,
                                          const DXGI_PRESENT_PARAMETERS *pPresentParameters)
 {
+  FfxviWrapTrace("Present1 enter");
   if(!RenderDoc::Inst().GetCaptureOptions().allowVSync)
   {
     SyncInterval = 0;
@@ -585,7 +655,9 @@ HRESULT WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UINT Flags,
     m_pDevice->Present(this, SyncInterval, Flags);
   }
 
-  return m_pReal1->Present1(SyncInterval, Flags, pPresentParameters);
+  HRESULT ret = m_pReal1->Present1(SyncInterval, Flags, pPresentParameters);
+  FfxviWrapTrace(StringFormat::Fmt("Present1 exit hr=%08x", (unsigned)ret).c_str());
+  return ret;
 }
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::GetRestrictToOutput(IDXGIOutput **ppRestrictToOutput)
@@ -1116,6 +1188,10 @@ WrappedIDXGIFactory::~WrappedIDXGIFactory()
 
 HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::QueryInterface(REFIID riid, void **ppvObject)
 {
+  if(ppvObject == NULL)
+    return E_POINTER;
+  *ppvObject = NULL;
+  FfxviWrapTrace(StringFormat::Fmt("factory QI %s", ToStr(riid).c_str()).c_str());
   // {713f394e-92ca-47e7-ab81-1159c2791e54}
   static const GUID IDXGIFactoryDWM_uuid = {
       0x713f394e, 0x92ca, 0x47e7, {0xab, 0x81, 0x11, 0x59, 0xc2, 0x79, 0x1e, 0x54}};
@@ -1223,14 +1299,25 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::QueryInterface(REFIID riid, void 
   }
   else if(riid == IDXGIFactoryDWM_uuid)
   {
+    if(IsFfxviWrapProcess())
+      return m_pReal->QueryInterface(riid, ppvObject);
     RDCWARN("Blocking QueryInterface for IDXGIFactoryDWM");
     return E_NOINTERFACE;
   }
   else if(riid == IDXGIFactoryDWM8_uuid)
   {
+    if(IsFfxviWrapProcess())
+      return m_pReal->QueryInterface(riid, ppvObject);
     RDCWARN("Blocking QueryInterface for IDXGIFactoryDWM8");
     return E_NOINTERFACE;
   }
+
+  // DXGI and vendor runtimes add private factory interfaces without a public SDK declaration.
+  // Returning E_NOINTERFACE here breaks applications which only use the private interface for
+  // capability/telemetry queries. Delegate unknown interfaces to the real factory; methods on
+  // the standard factory interfaces remain wrapped above.
+  if(IsFfxviWrapProcess())
+    return m_pReal->QueryInterface(riid, ppvObject);
 
   return RefCountDXGIObject::QueryInterface("IDXGIFactory", riid, ppvObject);
 }
@@ -1238,6 +1325,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGIFactory::QueryInterface(REFIID riid, void 
 HRESULT WrappedIDXGIFactory::CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_DESC *pDesc,
                                              IDXGISwapChain **ppSwapChain)
 {
+  FfxviWrapTrace("CreateSwapChain enter");
   RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChain device=%p wnd=%p", pDevice,
          pDesc ? (void *)pDesc->OutputWindow : NULL);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
@@ -1262,6 +1350,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChain(IUnknown *pDevice, DXGI_SWAP_CHAIN_
 
     if(SUCCEEDED(ret))
     {
+      FfxviWrapTrace("CreateSwapChain wrapped");
       *ppSwapChain =
           new WrappedIDXGISwapChain4(*ppSwapChain, desc ? desc->OutputWindow : NULL, wrapDevice);
     }
@@ -1279,6 +1368,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForHwnd(
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC *pFullscreenDesc, IDXGIOutput *pRestrictToOutput,
     IDXGISwapChain1 **ppSwapChain)
 {
+  FfxviWrapTrace("CreateSwapChainForHwnd enter");
   RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChainForHwnd device=%p hwnd=%p", pDevice,
          (void *)hWnd);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
@@ -1288,7 +1378,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForHwnd(
 
   if(wrapDevice)
   {
-    DXGI_SWAP_CHAIN_DESC1 local;
+    DXGI_SWAP_CHAIN_DESC1 local = {};
     DXGI_SWAP_CHAIN_DESC1 *desc = NULL;
 
     if(pDesc)
@@ -1328,6 +1418,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForCoreWindow(IUnknown *pDevice, IUn
                                                           IDXGIOutput *pRestrictToOutput,
                                                           IDXGISwapChain1 **ppSwapChain)
 {
+  FfxviWrapTrace("CreateSwapChainForCoreWindow enter");
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
 
   WrappedIDXGIOutput6 *wrappedOutput = (WrappedIDXGIOutput6 *)pRestrictToOutput;
@@ -1379,6 +1470,7 @@ HRESULT WrappedIDXGIFactory::CreateSwapChainForComposition(IUnknown *pDevice,
                                                            IDXGIOutput *pRestrictToOutput,
                                                            IDXGISwapChain1 **ppSwapChain)
 {
+  FfxviWrapTrace("CreateSwapChainForComposition enter");
   RDCLOG("TRACE: WrappedIDXGIFactory::CreateSwapChainForComposition device=%p", pDevice);
   ID3DDevice *wrapDevice = GetD3DDevice(pDevice);
 

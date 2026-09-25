@@ -1657,6 +1657,12 @@ HRESULT WrappedID3D12Device::QueryInterface(REFIID riid, void **ppvObject)
     return m_pDevice->QueryInterface(riid, ppvObject);
   }
 
+  // Preserve private/vendor interfaces exposed by the real device. Public interfaces handled
+  // above remain wrapped; unknown capability queries are passed through unchanged.
+  hr = m_pDevice->QueryInterface(riid, ppvObject);
+  if(SUCCEEDED(hr))
+    return hr;
+
   return m_RefCounter.QueryInterface("ID3D12Device", riid, ppvObject);
 }
 
@@ -1879,6 +1885,12 @@ void WrappedID3D12Device::ReleaseSwapchainResources(IDXGISwapper *swapper, UINT 
     if(!res)
       continue;
 
+    if(!WrappedID3D12Resource::IsAlloc(res))
+    {
+      RDCWARN("ReleaseSwapchainResources found an unwrapped backbuffer %p", res);
+      continue;
+    }
+
     WrappedID3D12Resource *wrapped = (WrappedID3D12Resource *)res;
     wrapped->ReleaseInternalRef();
     SAFE_RELEASE(wrapped);
@@ -1900,6 +1912,12 @@ void WrappedID3D12Device::NewSwapchainBuffer(IUnknown *backbuffer)
 
   if(pRes)
   {
+    if(!WrappedID3D12Resource::IsAlloc(pRes))
+    {
+      RDCWARN("NewSwapchainBuffer received an unwrapped resource %p", pRes);
+      return;
+    }
+
     WrappedID3D12Resource *wrapped = (WrappedID3D12Resource *)pRes;
     wrapped->AddInternalRef();
   }

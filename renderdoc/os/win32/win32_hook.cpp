@@ -188,7 +188,8 @@ struct CachedHookData
     // Also we exclude ourselves here - just in case the application has already loaded
     // renderdoc.dll, or tries to load it.
     if(strstr(lowername, "fraps") || strstr(lowername, "gameoverlayrenderer") ||
-       strstr(lowername, STRINGIZE(RDOC_BASE_NAME) ".dll") == lowername)
+       strstr(lowername, STRINGIZE(RDOC_BASE_NAME) ".dll") == lowername ||
+       strstr(lowername, "rdoc.dll") == lowername)
       return;
 
     // set module pointer if we are hooking exports from this module
@@ -918,6 +919,15 @@ static void InitHookData()
 
 void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionHook &hook)
 {
+  if(IsLauncherOnly())
+  {
+    rdcstr lib = strlower(rdcstr(libraryName));
+    bool processOnly = lib == "kernel32.dll" || lib == "advapi32.dll" ||
+                       lib.beginsWith("api-ms-win-core-processthreads-") || lib == "ws2_32.dll";
+    if(!processOnly)
+      return;
+  }
+
   if(!_stricmp(libraryName, "kernel32.dll"))
   {
     if(hook.function == "LoadLibraryA" || hook.function == "LoadLibraryW" ||
@@ -933,6 +943,15 @@ void LibraryHooks::RegisterFunctionHook(const char *libraryName, const FunctionH
 
 void LibraryHooks::RegisterLibraryHook(const char *libraryName, FunctionLoadCallback loadedCallback)
 {
+  if(IsLauncherOnly())
+  {
+    rdcstr lib = strlower(rdcstr(libraryName));
+    bool processOnly = lib == "kernel32.dll" || lib == "advapi32.dll" ||
+                       lib.beginsWith("api-ms-win-core-processthreads-") || lib == "ws2_32.dll";
+    if(!processOnly)
+      return;
+  }
+
   s_HookData->DllHooks[strlower(rdcstr(libraryName))].Callbacks.push_back(loadedCallback);
 }
 

@@ -364,17 +364,13 @@ public:
   ULONG STDMETHODCALLTYPE Release() { return RefCounter12::Release(); }
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject)
   {
-    // newer revision GUID of ID3D12DeviceFactory, see D3D12GetInterface_Impl
-    static const GUID IID_ID3D12DeviceFactory_vNext = {
-        0xdfafdd2c, 0x355f, 0x4cb3, {0xa8, 0xb2, 0xea, 0x7f, 0x92, 0x60, 0x14, 0x8b}};
-
     if(riid == __uuidof(IUnknown))
     {
       *ppvObject = (IUnknown *)(ID3D12DeviceFactory *)this;
       AddRef();
       return S_OK;
     }
-    if(riid == __uuidof(ID3D12DeviceFactory) || riid == IID_ID3D12DeviceFactory_vNext)
+    if(riid == __uuidof(ID3D12DeviceFactory))
     {
       *ppvObject = (ID3D12DeviceFactory *)this;
       AddRef();
@@ -772,7 +768,21 @@ private:
 
     RDCDEBUG("Called real createdevice... HRESULT: %s", ToStr(ret).c_str());
 
-    if(SUCCEEDED(ret) && ppDevice)
+    // D3D12CreateDevice deliberately returns S_FALSE for capability probes when the
+    // output pointer is NULL.  A caller may still pass the address of a NULL output
+    // variable, so checking only ppDevice is insufficient: never construct a wrapper
+    // unless the API actually returned a device object.
+    RDCLOG("Create_Internal result=%s ppDevice=%p object=%p", ToStr(ret).c_str(), (void *)ppDevice,
+           ppDevice ? *ppDevice : NULL);
+    if(SUCCEEDED(ret) && (!ppDevice || !*ppDevice))
+    {
+      // This is the documented capability-probe form (S_FALSE, no output object).
+      // Leave the probe completely transparent; no frame capturer or wrapper may be
+      // created for a non-existent device.
+      EndRecurse();
+      return ret;
+    }
+    if(SUCCEEDED(ret) && ppDevice && *ppDevice)
     {
       RDCDEBUG("succeeded and hooking.");
 
@@ -1015,49 +1025,19 @@ private:
       return E_NOINTERFACE;
     }
 
-    // newer Agility SDK / OS D3D12 runtimes (2025+) hand out a newer revision of
-    // ID3D12DeviceFactory under a GUID that isn't in any public header yet.
-    // {dfafdd2c-355f-4cb3-a8b2-ea7f9260148b}
-    static const GUID IID_ID3D12DeviceFactory_vNext = {
+    // This is ID3D12CoreModule (defined in d3d12_sdk_select.cpp), an internal
+    // loader interface rather than a device factory. It must retain its native
+    // vtable. The replay-side SDK selection code wraps it separately when needed.
+    static const GUID IID_ID3D12CoreModule = {
         0xdfafdd2c, 0x355f, 0x4cb3, {0xa8, 0xb2, 0xea, 0x7f, 0x92, 0x60, 0x14, 0x8b}};
 
     IUnknown *realUnk = NULL;
     HRESULT real_call = real(rclsid, riid, (void **)&realUnk);
 
-    if(SUCCEEDED(real_call) && realUnk && riid == IID_ID3D12DeviceFactory_vNext)
+    if(SUCCEEDED(real_call) && realUnk && riid == IID_ID3D12CoreModule)
     {
-      // identify what module the returned object's functions live in, for diagnostics
-      void **vt = *(void ***)realUnk;
-      for(int i = 0; i < 6; i++)
-      {
-        HMODULE m = NULL;
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)vt[i], &m);
-        wchar_t modname[MAX_PATH] = {};
-        if(m)
-          GetModuleFileNameW(m, modname, MAX_PATH);
-        RDCLOG("vNext vtable[%d] = %p (%ls)", i, vt[i], m ? modname : L"unknown");
-      }
-
-      // try to obtain the publicly-known ID3D12DeviceFactory from the same object and wrap
-      // that, so device creation goes through our Create_Internal
-      ID3D12DeviceFactory *known = NULL;
-      HRESULT qih = realUnk->QueryInterface(__uuidof(ID3D12DeviceFactory), (void **)&known);
-      RDCLOG("vNext interface: QI for known ID3D12DeviceFactory -> %x", qih);
-
-      if(SUCCEEDED(qih) && known)
-      {
-        *ppvDebug = new WrappedID3D12DeviceFactory(known);
-        RDCLOG("vNext interface: wrapped as ID3D12DeviceFactory");
-        return S_OK;
-      }
-
-      // can't wrap - pass the raw interface through rather than failing. RE Engine
-      // (Onimusha WotS) aborts outright if this query returns E_NOINTERFACE.
-      RDCLOG("vNext interface: passing through raw, capture of this device not possible");
       *ppvDebug = realUnk;
-      return S_OK;
+      return real_call;
     }
 
     HRESULT hr = GetWrappedInterface(realUnk, riid, ppvDebug);
@@ -1123,7 +1103,6 @@ private:
     RDCLOG("ExportPatch: processing module %s", moduleName);
 
     bool isCore = (strcmp(moduleName, "D3D12Core.dll") == 0);
-
     ExportPatch createPatch = {
         moduleName,
         "D3D12CreateDevice",

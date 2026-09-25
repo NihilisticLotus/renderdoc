@@ -491,7 +491,10 @@ static bool InitDbgHelp()
   else
   {
     wchar_t path[MAX_PATH] = {0};
-    GetModuleFileNameW(GetModuleHandleA(STRINGIZE(RDOC_BASE_NAME) ".dll"), path, MAX_PATH - 1);
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCWSTR)(uintptr_t)&dllLocator, &module);
+    GetModuleFileNameW(module, path, MAX_PATH - 1);
 
     wchar_t *slash = wcsrchr(path, '\\');
 
