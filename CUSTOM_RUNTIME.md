@@ -216,3 +216,48 @@ Replay API 返回成功，统计为 204 个 action、51 次 draw、61 次 dispat
   精确子进程后两个项目均成功构建。不能只结束 KZ 父进程就假设所有 RenderDoc 使用者都已退出。
 
 临时 GPU 内存转储、导出函数跳转日志及 Dispatch 标记均已从最终源码移除。
+
+### 2026-09-27：当前标准 Launch 验证（以下结论优先于上面的历史记录）
+
+这轮没有把“能启动”当成“能截帧”。完整三游戏回归时的同一个 Development 构建的
+`renderdoc.dll`/`rdoc.dll` SHA256 均为
+`4493E572E458AEFD9257C9CEA16357F08B8B6AFB59A29411F94E6CE4FD96CC4B`。
+直接打开 `E:\RenderDocProject\renderdoc\x64\Development\qrenderdoc.exe`，
+对每个游戏点击 GUI 的 **Launch**，在目标窗口按 **F12**，再用该构建的独立回放 API
+打开捕获并导出最后呈现图像，得到：
+
+| 游戏 | 注入边界 | 本轮捕获 | 独立回放 |
+| --- | --- | --- | --- |
+| 鬼武者 | Steam 创建游戏进程；GUI 自动连接到游戏控制端点 | `captures\Onimusha_Launch_20260927_build4493.rdc` | 成功；205 actions、54 draws，标题与现场一致 |
+| 最终幻想 XVI | 直接 Launch 所选 EXE | `captures\FFXVI_Launch_20260927_build4493.rdc` | 成功；3062 actions、302 draws，主菜单与现场一致 |
+| 第一狂战士：卡赞 | 直接 Launch `KZ.exe`，并勾选 Capture Child Processes；自动连接 `BBQ-Win64-Shipping.exe` | `captures\Khazan_Launch_20260927_build4493.rdc` | 成功；399 actions、176 draws，难度选择画面与现场一致 |
+
+鬼武者的 Steam 分支仅是经本机 A/B 复现后采用的进程创建边界：本轮无 RenderDoc 的
+直接 EXE 启动也曾自行退出，而 Steam 原生启动保持运行；但此前另一次直接注入测试
+曾成功，因此**尚不能断言 Steam 票据或某一固定机制是唯一根因**。本轮修复了可测的
+注入时序：已运行的 Steam 必须先被注入，再提交 `-applaunch` 请求；连接游戏后，
+Steam 的 `hookIntoChildren` 立即恢复为 0，避免继续注入后续游戏。
+
+卡赞的父进程会在创建已暂停的图形子进程时先完成子进程注入。进程列表可能先于控制
+端点观察到子进程；GUI 给父进程最多 2 秒完成操作，再决定是否需要兜底注入，
+避免同一子进程被注入两次。本轮日志显示连接到已注入的子进程。
+
+最终幻想 XVI 与鬼武者的 DLSS 超分目前仍按先前兼容设置关闭；这轮不证明 DLSS-on
+回放已支持。GUI 仍显示“Vulkan capture is not configured”的黄色提示；三款测试
+均走 D3D12，此提示与这些验证无关，也不是 Global Process Hook 红色警告。
+
+卡赞关闭游戏窗口后，其进程未及时自行退出；本轮核对了进程路径，仅结束本次测试的
+`BBQ-Win64-Shipping.exe` 和 `KZ.exe`。这属于尚未定位的退出问题，不能称已修复。
+部署前正常关闭 GUI 与 Steam，确认 E: 构建 DLL 可独占读写、MSBuild 成功，
+再用 `deploy_custom_runtime.ps1` 更新 `C:\RenderDocCustom`。源码收尾仅移除了临时
+诊断输出、恢复空 Steam 安装路径检查，并使等待游戏超时明确报错；成功启动和捕获
+路径未改变。收尾构建 SHA256 为
+`BDB18AF5F451B0125FE165800798AD44814339F9DF7A7018308D3002A1F3F74E`，
+又在全新 Steam 会话通过 GUI Launch/F12 抓取
+`captures\Onimusha_Launch_20260927_final.rdc`，独立回放 205 actions、54 draws，
+画面与现场一致。前述另外两款的帧也都由收尾构建再次独立回放成功。
+最后去掉了与基线等效的临时重构，重新编译并复测三份回放、Pipeline Library
+契约，均通过。最终部署的 `C:\RenderDocCustom` `renderdoc.dll` 和 `rdoc.dll`
+SHA256 均为 `781851DC80059DD45EFC31DAD56B6B5620F41E46CF7153A7FE374A65702A5AEB`。
+开发版 GUI 或被注入的 Steam 仍在运行时，Windows 会占用 E:
+构建文件；本轮没有实现“进程仍加载 DLL 时热编译覆盖”的能力。

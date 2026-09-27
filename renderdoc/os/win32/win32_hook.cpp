@@ -291,7 +291,7 @@ struct CachedHookData
       return;
 
     // windows 11 and newer versions have weird hotpatch DLLs that don't act like real DLLs. The
-    // LoadLibraryW below will fail for these DLLs even when using the module path provided.
+    // These are not ordinary loadable modules, even when using the module path provided.
     // Only check the path for DLLs that might be a windows-hotpatch but if it matches we'll skip
     // hooking these to avoid problems
     if(strstr(lowername, "hotpatch"))
@@ -310,14 +310,18 @@ struct CachedHookData
         return;
     }
 
-    // increment the module reference count, so it doesn't disappear while we're processing it
-    // there's a very small race condition here between if GetModuleFileName returns, the module is
-    // unloaded then we load it again. The only way around that is inserting very scary locks
-    // between here
-    // and FreeLibrary that I want to avoid. Worst case, we load a dll, hook it, then unload it
-    // again.
-    HMODULE refcountModHandle = LoadLibraryW(modpath);
-    RDCASSERTEQUAL(refcountModHandle, module);
+    // Retain the already-loaded module without invoking the library-loading path again. LoadLibrary
+    // can enter another capture/overlay tool's hooks on every module scan, and can reload a module
+    // which disappeared since the snapshot. Balance this reference with FreeLibrary below.
+    HMODULE refcountModHandle = NULL;
+    if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, (LPCWSTR)module,
+                          &refcountModHandle))
+      return;
+    if(refcountModHandle != module)
+    {
+      FreeLibrary(refcountModHandle);
+      return;
+    }
     byte *baseAddress = (byte *)refcountModHandle;
 
     PIMAGE_DOS_HEADER dosheader = (PIMAGE_DOS_HEADER)baseAddress;

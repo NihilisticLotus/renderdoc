@@ -29,6 +29,8 @@ HRESULT WrappedID3D12Device::CreatePipelineLibrary(_In_reads_(BlobLength) const 
                                                    SIZE_T BlobLength, REFIID riid,
                                                    _COM_Outptr_ void **ppPipelineLibrary)
 {
+  RDCLOG("CreatePipelineLibrary: blob=%p length=%llu iid=%s output=%p", pLibraryBlob,
+         (unsigned long long)BlobLength, ToStr(riid).c_str(), ppPipelineLibrary);
   // CreatePipelineLibrary supports doing a dry run if ppPipelineLibrary receives
   // nullptr. That feature is optional and not supported in every driver, since
   // we are not supporting pipeline libraries anyway, returns the unsupported
@@ -36,19 +38,35 @@ HRESULT WrappedID3D12Device::CreatePipelineLibrary(_In_reads_(BlobLength) const 
   if(ppPipelineLibrary == NULL)
     return DXGI_ERROR_UNSUPPORTED;
 
-// we don't want to ever use pipeline libraries since then we can't get the
-// bytecode and pipeline config. So instead we always return that a blob is
-// non-matching and return a dummy interface that does nothing when stored.
-// This might cause the application to clear its previous cache but that's
-// not the end of the world.
+// Opaque disk caches hide pipeline bytecode/configuration. Reject those blobs,
+// but allow an in-process library: its successful loads are recreated through
+// wrapped Create*Pipeline* calls using the application's complete descriptor.
 #ifndef D3D12_ERROR_DRIVER_VERSION_MISMATCH
 #define D3D12_ERROR_DRIVER_VERSION_MISMATCH _HRESULT_TYPEDEF_(0x887E0002L)
 #endif
 
-  if(BlobLength > 0)
+  // Serialize() emits this empty-cache token. Applications may serialize and recreate the
+  // library during the same run, so accept our own token instead of reporting a driver change.
+  // Native cache blobs must still be rejected: their opaque PSOs cannot be captured.
+  const byte emptyCache[WrappedID3D12PipelineLibrary::DummyBytes] = {};
+  const bool ownEmptyCache = pLibraryBlob && BlobLength == sizeof(emptyCache) &&
+                             memcmp(pLibraryBlob, emptyCache, sizeof(emptyCache)) == 0;
+  if(BlobLength > 0 && !ownEmptyCache)
+  {
+    RDCLOG("CreatePipelineLibrary: rejecting cached blob with DRIVER_VERSION_MISMATCH");
     return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+  }
 
-  WrappedID3D12PipelineLibrary *pipeLibrary = new WrappedID3D12PipelineLibrary(ResourceId(), this);
+  ID3D12PipelineLibrary *nativeLibrary = NULL;
+  HRESULT hr = m_pDevice1->CreatePipelineLibrary(NULL, 0, __uuidof(ID3D12PipelineLibrary),
+                                               (void **)&nativeLibrary);
+  if(FAILED(hr))
+  {
+    *ppPipelineLibrary = NULL;
+    return hr;
+  }
+  WrappedID3D12PipelineLibrary *pipeLibrary =
+      new WrappedID3D12PipelineLibrary(ResourceId(), this, nativeLibrary);
 
   if(riid == __uuidof(ID3D12PipelineLibrary))
   {
@@ -66,6 +84,7 @@ HRESULT WrappedID3D12Device::CreatePipelineLibrary(_In_reads_(BlobLength) const 
     return E_NOINTERFACE;
   }
 
+  RDCLOG("CreatePipelineLibrary: returning capture-visible library %p", *ppPipelineLibrary);
   return S_OK;
 }
 

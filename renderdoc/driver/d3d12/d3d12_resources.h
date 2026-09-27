@@ -1783,6 +1783,9 @@ public:
 
 class WrappedID3D12PipelineLibrary : public WrappedDeviceChild12<ID3D12PipelineLibrary1>
 {
+  // The native library validates names/descriptors, but never imports opaque disk caches.
+  ID3D12PipelineLibrary *m_Library = NULL;
+
 public:
   ALLOCATE_WITH_WRAPPED_POOL(WrappedID3D12PipelineLibrary);
 
@@ -1791,34 +1794,63 @@ public:
     TypeEnum = Resource_PipelineLibrary,
   };
 
-  WrappedID3D12PipelineLibrary(ResourceId id, WrappedID3D12Device *device)
-      : WrappedDeviceChild12(id, NULL, device)
+  WrappedID3D12PipelineLibrary(ResourceId id, WrappedID3D12Device *device,
+                             ID3D12PipelineLibrary *library)
+      : WrappedDeviceChild12(id, NULL, device), m_Library(library)
   {
   }
-  virtual ~WrappedID3D12PipelineLibrary() { Shutdown(); }
+  virtual ~WrappedID3D12PipelineLibrary()
+  {
+    SAFE_RELEASE(m_Library);
+    Shutdown();
+  }
   virtual HRESULT STDMETHODCALLTYPE StorePipeline(_In_opt_ LPCWSTR pName,
                                                   _In_ ID3D12PipelineState *pPipeline)
   {
-    // do nothing
-    return S_OK;
+    return m_Library->StorePipeline(pName, pPipeline ?
+        ((WrappedID3D12PipelineState *)pPipeline)->GetReal() : NULL);
   }
 
   virtual HRESULT STDMETHODCALLTYPE
   LoadGraphicsPipeline(_In_ LPCWSTR pName, _In_ const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pDesc,
                        REFIID riid, _COM_Outptr_ void **ppPipelineState)
   {
-    // pretend we don't have it - assume that the application won't store then
-    // load in the same run, or will handle that if it happens
-    return E_INVALIDARG;
+    if(!pDesc)
+      return E_INVALIDARG;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC desc = *pDesc;
+    desc.pRootSignature = desc.pRootSignature ?
+        ((WrappedID3D12RootSignature *)desc.pRootSignature)->GetReal() : NULL;
+    if(!ppPipelineState)
+      return m_Library->LoadGraphicsPipeline(pName, &desc, riid, NULL);
+    *ppPipelineState = NULL;
+    ID3D12PipelineState *validated = NULL;
+    HRESULT hr = m_Library->LoadGraphicsPipeline(pName, &desc, riid, (void **)&validated);
+    if(FAILED(hr))
+      return hr;
+    SAFE_RELEASE(validated);
+    // Recreate through the ordinary wrapped entry point so the full descriptor and
+    // shader bytecode are recorded. A successful in-memory cache hit is not a miss.
+    return m_pDevice->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
   }
 
   virtual HRESULT STDMETHODCALLTYPE
   LoadComputePipeline(_In_ LPCWSTR pName, _In_ const D3D12_COMPUTE_PIPELINE_STATE_DESC *pDesc,
                       REFIID riid, _COM_Outptr_ void **ppPipelineState)
   {
-    // pretend we don't have it - assume that the application won't store then
-    // load in the same run, or will handle that if it happens
-    return E_INVALIDARG;
+    if(!pDesc)
+      return E_INVALIDARG;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc = *pDesc;
+    desc.pRootSignature = desc.pRootSignature ?
+        ((WrappedID3D12RootSignature *)desc.pRootSignature)->GetReal() : NULL;
+    if(!ppPipelineState)
+      return m_Library->LoadComputePipeline(pName, &desc, riid, NULL);
+    *ppPipelineState = NULL;
+    ID3D12PipelineState *validated = NULL;
+    HRESULT hr = m_Library->LoadComputePipeline(pName, &desc, riid, (void **)&validated);
+    if(FAILED(hr))
+      return hr;
+    SAFE_RELEASE(validated);
+    return m_pDevice->CreateComputePipelineState(pDesc, riid, ppPipelineState);
   }
 
   static const SIZE_T DummyBytes = 32;
@@ -1846,9 +1878,31 @@ public:
                                                  const D3D12_PIPELINE_STATE_STREAM_DESC *pDesc,
                                                  REFIID riid, void **ppPipelineState)
   {
-    // pretend we don't have it - assume that the application won't store then
-    // load in the same run, or will handle that if it happens
-    return E_INVALIDARG;
+    if(!pDesc)
+      return E_INVALIDARG;
+    D3D12_EXPANDED_PIPELINE_STATE_STREAM_DESC expanded(*pDesc);
+    if(expanded.errored)
+      return E_INVALIDARG;
+    D3D12_PACKED_PIPELINE_STATE_STREAM_DESC desc(expanded);
+    desc.Unwrap();
+    ID3D12PipelineLibrary1 *library1 = NULL;
+    HRESULT hr = m_Library->QueryInterface(__uuidof(ID3D12PipelineLibrary1), (void **)&library1);
+    if(FAILED(hr))
+      return hr;
+    if(!ppPipelineState)
+    {
+      hr = library1->LoadPipeline(pName, desc.AsDescStream(), riid, NULL);
+      library1->Release();
+      return hr;
+    }
+    *ppPipelineState = NULL;
+    ID3D12PipelineState *validated = NULL;
+    hr = library1->LoadPipeline(pName, desc.AsDescStream(), riid, (void **)&validated);
+    library1->Release();
+    if(FAILED(hr))
+      return hr;
+    SAFE_RELEASE(validated);
+    return m_pDevice->CreatePipelineState(pDesc, riid, ppPipelineState);
   }
 };
 

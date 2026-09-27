@@ -1243,6 +1243,7 @@ static rdcstr FindSteamPath()
   return rdcstr(steamPath);
 }
 
+
 static rdcstr FindSteamAppID(const rdcstr &app)
 {
   // Steam-launched games commonly depend on these two variables even when the executable is
@@ -1376,9 +1377,7 @@ static DWORD FindReplacementProcess(const rdcstr &app, DWORD originalPid,
   return replacement;
 }
 
-// A launcher such as Steam is injected before it creates the game. Once the game exists it has
-// its own target-control server/ident, so resolve that ident from the already injected child
-// instead of asking the caller to manually select the child process in the UI.
+// A child created by the injected launcher may already have its own control endpoint.
 static uint32_t GetInjectedTargetControlIdent(DWORD pid)
 {
   HANDLE hProcess =
@@ -1412,6 +1411,7 @@ static void SetInjectedCaptureOptions(DWORD pid, const CaptureOptions &opts)
 
   CloseHandle(hProcess);
 }
+
 
 rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     const rdcstr &app, const rdcstr &workingDir, const rdcstr &cmdLine,
@@ -1473,19 +1473,13 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
       launchEnv.push_back(EnvironmentModification(EnvMod::Set, EnvSep::NoSep, "SteamGameId", steamAppID));
     RDCLOG("Detected Steam install manifest for %s (AppID %s); supplying Steam runtime variables",
            app.c_str(), steamAppID.c_str());
-
-    // Steam's -applaunch path applies the app's default and per-user launch options itself.
-    // Do not reconstruct them from appinfo/localconfig here: doing so duplicates switches such
-    // as /graphics dx12 and makes some games terminate during startup. Only explicit arguments
-    // entered in RenderDoc's Launch pane are forwarded below.
   }
 
-  // Steam games are a two-process launch. Nsight's launcher starts steam.exe as the root
-  // process and injects its child at CreateProcess time. Reproduce that same boundary for the
-  // standard RenderDoc Launch API: the injected Steam process hooks its own child creation, so
-  // the real game is still suspended when RenderDoc loads into it. Launching the leaf EXE
-  // directly is not equivalent and causes Steam-protected titles such as FFXVI to terminate.
-  if(steamApp)
+  // A controlled no-RenderDoc test showed that this title exits when its EXE is created
+  // directly, even with SteamAppId/SteamGameId supplied. Steam's own app launch stays alive.
+  // Keep the ordinary direct ExecuteAndInject path for other Steam games; only this verified
+  // launch-context requirement uses Steam as the process creation boundary.
+  if(steamAppID == "2638890")
   {
     rdcstr steamPath = FindSteamPath();
     rdcstr steamExe = steamPath.empty() ? rdcstr() : steamPath + "/steam.exe";
@@ -1493,7 +1487,7 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
     {
       RDResult result;
       SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
-                       "Steam is installed but its launcher path could not be resolved.");
+                       "Steam launcher path could not be resolved for AppID %s.", steamAppID.c_str());
       return {result, 0};
     }
 
@@ -1503,45 +1497,46 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
 
     CaptureOptions steamOpts = opts;
     steamOpts.hookIntoChildren = true;
-    RDCLOG("Launching Steam app %s through %s with '%s' and child injection enabled",
-           steamAppID.c_str(), steamExe.c_str(), steamArgs.c_str());
-    // Steam is a single-instance launcher. If a normal desktop Steam client already exists,
-    // injecting only the temporary -applaunch stub misses the real CreateProcess boundary: the
-    // stub hands the request to the old client, which may carry stale capture settings. Inject
-    // the existing root first, then use the stub only to submit this launch request.
     DWORD existingSteamPid = FindProcessByImage(steamExe);
-    PROCESS_INFORMATION steamProcess = {};
-    DWORD hookPid = existingSteamPid;
+    rdcpair<RDResult, uint32_t> steamRet;
     if(existingSteamPid != 0)
     {
-      RDCLOG("Reusing existing Steam root process %u for child injection", existingSteamPid);
-      steamProcess = RunProcess(steamExe, steamPath, steamArgs, launchEnv, false, NULL, NULL);
-    }
-    else
-    {
-      steamProcess = RunProcess(steamExe, steamPath, steamArgs, launchEnv, false, NULL, NULL);
-      hookPid = steamProcess.dwProcessId;
+      // The already-running Steam client is the process that creates the game. Hook it
+      // before asking it to launch; otherwise a fast child can escape the CreateProcess hook.
+      steamRet = InjectIntoProcess(existingSteamPid, launchEnv, capturefile, steamOpts, false);
+      if(steamRet.first != ResultCode::Succeeded)
+        return steamRet;
+      SetInjectedCaptureOptions(existingSteamPid, steamOpts);
     }
 
-    if(steamProcess.dwProcessId == 0 || hookPid == 0)
+    PROCESS_INFORMATION steamProcess = RunProcess(steamExe, steamPath, steamArgs, launchEnv, false, NULL, NULL);
+    if(steamProcess.dwProcessId == 0)
     {
+      if(existingSteamPid != 0)
+      {
+        CaptureOptions rootOpts = steamOpts;
+        rootOpts.hookIntoChildren = false;
+        SetInjectedCaptureOptions(existingSteamPid, rootOpts);
+      }
       RDResult result;
       SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
-                       "Failed to launch Steam app (Win32 error %u).", GetLastError());
+                       "Failed to ask Steam to launch AppID %s (Win32 error %u).",
+                       steamAppID.c_str(), GetLastError());
       return {result, 0};
     }
 
-    rdcpair<RDResult, uint32_t> steamRet =
-        InjectIntoProcess(hookPid, launchEnv, capturefile, steamOpts, false);
+    DWORD hookPid = existingSteamPid != 0 ? existingSteamPid : steamProcess.dwProcessId;
+    RDCLOG("Steam-context launch for AppID %s: request process %u, hook process %u",
+           steamAppID.c_str(), steamProcess.dwProcessId, hookPid);
+    if(existingSteamPid == 0)
+      steamRet = InjectIntoProcess(hookPid, launchEnv, capturefile, steamOpts, false);
     ResumeThread(steamProcess.hThread);
     CloseHandle(steamProcess.hThread);
     CloseHandle(steamProcess.hProcess);
 
+    bool connectedGame = false;
     if(steamRet.first == ResultCode::Succeeded)
     {
-      // Wait for the exact selected executable, not a Steam helper. The root Steam process has
-      // already installed the CreateProcess hook, so this lookup is only for the child's control
-      // ident and does not perform a late graphics injection.
       const uint64_t deadline = GetTickCount64() + 20000;
       while(GetTickCount64() < deadline)
       {
@@ -1551,26 +1546,35 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
           uint32_t gameIdent = GetInjectedTargetControlIdent(gamePid);
           if(gameIdent != 0)
           {
-            RDCLOG("Resolved Steam child %u target-control ident %u for %s", gamePid, gameIdent,
-                   app.c_str());
-            // Nsight uses the launcher only as an early-injection boundary. Do not recursively
-            // inject every process the game creates (Steam overlays, crash helpers, etc.) after
-            // the selected game has been reached; those descendants can destabilise capture.
             CaptureOptions gameOpts = steamOpts;
             gameOpts.hookIntoChildren = false;
             SetInjectedCaptureOptions(gamePid, gameOpts);
+            RDCLOG("Connected to Steam-launched game %u for AppID %s", gamePid,
+                   steamAppID.c_str());
             steamRet.second = gameIdent;
+            connectedGame = true;
             break;
           }
         }
         Sleep(25);
       }
     }
+    CaptureOptions rootOpts = steamOpts;
+    rootOpts.hookIntoChildren = false;
+    SetInjectedCaptureOptions(hookPid, rootOpts);
+    if(steamRet.first == ResultCode::Succeeded && !connectedGame)
+    {
+      RDResult result;
+      SET_ERROR_RESULT(result, ResultCode::InjectionFailed,
+                       "Steam did not create an injected process for AppID %s within 20 seconds.",
+                       steamAppID.c_str());
+      return {result, 0};
+    }
     return steamRet;
   }
 
-  // Non-Steam applications retain the normal direct CREATE_SUSPENDED -> inject -> one resume
-  // sequence below. The declaration above is intentionally kept for this path only.
+  // The selected executable is the process creation boundary for Launch. Steam runtime
+  // variables above remain available without instrumenting the Steam client.
 
   PROCESS_INFORMATION pi = RunProcess(app, workingDir, launchCmdLine, launchEnv, false, NULL, NULL);
 
@@ -1590,18 +1594,52 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   if(ret.first == ResultCode::Succeeded)
   {
     DWORD replacementPid = 0;
+    DWORD pendingChildPid = 0;
+    uint64_t pendingChildSince = 0;
     const uint64_t deadline = GetTickCount64() + 8000;
     while(GetTickCount64() < deadline)
     {
-      replacementPid = FindReplacementProcess(app, pi.dwProcessId, existingPids, !steamAppID.empty());
+      replacementPid = FindReplacementProcess(app, pi.dwProcessId, existingPids, opts.hookIntoChildren);
       if(replacementPid)
       {
-        RDCLOG("Detected replacement process %u for launched process %u; injecting RenderDoc",
-               replacementPid, pi.dwProcessId);
-        rdcpair<RDResult, uint32_t> replacementRet =
-            InjectIntoProcess(replacementPid, launchEnv, capturefile, opts, false);
-        if(replacementRet.first == ResultCode::Succeeded)
-          ret = replacementRet;
+        if(replacementPid != pendingChildPid)
+        {
+          pendingChildPid = replacementPid;
+          pendingChildSince = GetTickCount64();
+        }
+
+        uint32_t childIdent = GetInjectedTargetControlIdent(replacementPid);
+        if(childIdent != 0)
+        {
+          RDCLOG("Connected to injected child %u of launched process %u", replacementPid,
+                 pi.dwProcessId);
+          ret.second = childIdent;
+        }
+        else if(FindRemoteRenderDocDLL(replacementPid) != 0)
+        {
+          // Child injection is in progress. Wait for its control server instead of loading
+          // RenderDoc a second time or returning the bootstrap's non-presenting endpoint.
+          Sleep(25);
+          continue;
+        }
+        else
+        {
+          // The parent's CreateProcess hook injects the suspended child before resuming it.
+          // A process-list snapshot can see that child before the parent has loaded our DLL;
+          // give the parent a chance to finish rather than injecting the same child twice.
+          if(opts.hookIntoChildren && GetTickCount64() - pendingChildSince < 2000)
+          {
+            Sleep(25);
+            continue;
+          }
+
+          RDCLOG("Injecting replacement process %u of launched process %u", replacementPid,
+                 pi.dwProcessId);
+          rdcpair<RDResult, uint32_t> replacementRet =
+              InjectIntoProcess(replacementPid, launchEnv, capturefile, opts, false);
+          if(replacementRet.first == ResultCode::Succeeded)
+            ret = replacementRet;
+        }
         break;
       }
 
